@@ -1,9 +1,14 @@
 import * as Cesium from 'cesium';
 import { StyleManager } from './ui.js';
-import { flyToAustin } from './camera.js';
+import { flyToWorldView } from './camera.js';
+import { initCommandRail } from './commandRail.js';
+import { initNewsRoster } from './newsRoster.js';
+import { installGevCommandBusClient } from './gevCommandBusClient.js';
 import { DataLayerManager } from './data/manager.js';
 import flightsLayer from './data/flights.js';
 import militaryFlightsLayer from './data/militaryFlights.js';
+import conflictsLayer from './data/conflicts.js';
+import newsLayer from './data/news.js';
 import earthquakesLayer from './data/earthquakes.js';
 import satellitesLayer from './data/satellites.js';
 import rocketLaunchesLayer from './data/rocketLaunches.js';
@@ -195,10 +200,10 @@ async function init() {
     const weatherEffects = null;
     const cockpitCloudEffects = initCockpitCloudEffects(viewer);
 
-    // If no share link state, do default fly-to Austin
+    // If no share link state, open on the whole world (command globe, not a city)
     if (!styleManager.hasShareState) {
-      loaderStatus.textContent = 'Flying to Austin, TX...';
-      flyToAustin(viewer);
+      loaderStatus.textContent = 'Opening the world...';
+      flyToWorldView(viewer);
     } else {
       loaderStatus.textContent = 'Restoring shared view...';
     }
@@ -209,6 +214,8 @@ async function init() {
     });
     dataManager.register(flightsLayer);
     dataManager.register(militaryFlightsLayer);
+    dataManager.register(conflictsLayer);
+    dataManager.register(newsLayer);
     dataManager.register(earthquakesLayer);
     dataManager.register(satellitesLayer);
     dataManager.register(rocketLaunchesLayer);
@@ -237,6 +244,8 @@ async function init() {
       };
     }
     dataManager.buildTogglePanel(document.getElementById('data-toggles'));
+    // NEWS roster: readable headlines beside the pins, shown while News is ON.
+    initNewsRoster({ dataManager });
     styleManager.attachDataManager(dataManager);
 
     // Initialize deterministic scene playback for social clip capture
@@ -327,6 +336,10 @@ async function init() {
       requestRender: governorRequestRender,
     };
     window.__godsEyeView.voiceCommands = initGevVoiceCommands({ viewer, styleManager, dataManager, sceneDirector, annotations });
+    initCommandRail({ viewer, dataManager });
+    // Command bus ear for Hermes MCP (POST /api/gev/command → SSE). Idempotent;
+    // commands resolve live app handles at execution time, so boot order is free.
+    installGevCommandBusClient();
 
   } catch (error) {
     console.error("God's Eye View initialization failed:", error);

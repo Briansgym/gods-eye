@@ -172,6 +172,7 @@ const CREDIT_EXPECTATIONS = {
   radio: /Radio Browser/i,
   bikeshare: /GBFS|bikeshare/i,
   'ais-live-vessels': /AISStream/i,
+  conflicts: /UCDP|Uppsala/i,
   'military-installations': /OpenStreetMap/i,
   'local-datacenters': /OpenStreetMap/i,
   'local-dams': /OpenStreetMap/i,

@@ -224,6 +224,59 @@ test('selection lifecycle ignores vessels, accepts installations, and clears wit
   }
 });
 
+test('selection lifecycle renders any layer entity that carries a tracked presentation model', () => {
+  const originalWindow = globalThis.window;
+  const fakeWindow = new EventTarget();
+  const changed = makeCesiumEvent();
+  const viewer = { trackedEntity: null, trackedEntityChanged: changed };
+  const recorder = makeHostRecorder();
+  const conflict = {
+    gevTrackedId: 'conflict:628272',
+    gevDisplayPosition: () => ({ x: 4, y: 5, z: 6 }),
+    gevLabelModel: {
+      title: 'Sahel insurgency',
+      details: ['STATE-BASED', '34 fatalities', '2026-06-04', 'Mali'],
+      accent: '#ff5252',
+    },
+  };
+  const news = {
+    gevTrackedId: 'news:ab12',
+    gevDisplayPosition: () => ({ x: 7, y: 8, z: 9 }),
+    gevLabelModel: { title: 'PORT REOPENS', details: ['reuters.com'], accent: '#7fd4a0' },
+  };
+  globalThis.window = fakeWindow;
+  _setTrackedOverlayHostForTest(recorder.host);
+  try {
+    initTrackedReadout(viewer);
+    const setsBefore = recorder.calls.filter(({ op }) => op === 'set').length;
+
+    fakeWindow.dispatchEvent(new CustomEvent('gev:entity-selected', {
+      detail: { layerId: 'conflicts', entity: conflict },
+    }));
+    assert.equal(getActiveTrackedReadoutId(), 'conflict:628272');
+    const conflictSet = recorder.calls.filter(({ op }) => op === 'set').at(-1);
+    assert.equal(conflictSet.entries[0].title, 'Sahel insurgency');
+    assert.deepEqual(conflictSet.entries[0].details, ['STATE-BASED', '34 fatalities', '2026-06-04', 'Mali']);
+
+    fakeWindow.dispatchEvent(new CustomEvent('gev:entity-selected', {
+      detail: { layerId: 'news', entity: news },
+    }));
+    assert.equal(getActiveTrackedReadoutId(), 'news:ab12');
+    assert.equal(recorder.calls.filter(({ op }) => op === 'set').length, setsBefore + 2);
+
+    // A selected entity without a presentation model still must not paint a card.
+    fakeWindow.dispatchEvent(new CustomEvent('gev:entity-selected', {
+      detail: { layerId: 'earthquakes', entity: {} },
+    }));
+    assert.equal(getActiveTrackedReadoutId(), null);
+    assert.equal(recorder.calls.filter(({ op }) => op === 'set').length, setsBefore + 2);
+  } finally {
+    destroyTrackedReadout();
+    _setTrackedOverlayHostForTest();
+    globalThis.window = originalWindow;
+  }
+});
+
 test('trackedReadout cannot resurrect a dedicated canvas or render listener', async () => {
   const source = await readFile(new URL('./trackedReadout.js', import.meta.url), 'utf8');
   for (const forbidden of [

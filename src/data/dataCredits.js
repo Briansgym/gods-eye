@@ -67,6 +67,12 @@ export const DATA_CREDITS = [
     html: 'Earthquakes: Data courtesy of the U.S. Geological Survey',
   },
   {
+    key: 'ucdp',
+    html:
+      'Armed conflicts: <a href="https://ucdp.uu.se/" target="_blank" rel="noopener">UCDP Candidate GED</a>, ' +
+      'Uppsala Conflict Data Program, Uppsala University (CC BY 4.0)',
+  },
+  {
     key: 'overpass',
     html:
       'Road geometry (traffic): ' +
@@ -104,7 +110,7 @@ export const DATA_CREDITS = [
   {
     key: 'gdelt',
     html:
-      'Cockpit regional headlines: ' +
+      'Cockpit regional headlines &amp; world news pins: ' +
       '<a href="https://www.gdeltproject.org/about.html" target="_blank" rel="noopener">GDELT Project</a> ' +
       '(location-matched article links; publisher terms apply)',
   },
@@ -126,6 +132,24 @@ export const DATA_CREDITS = [
       'CCTV cameras &amp; frames (London): ' +
       '<a href="https://tfl.gov.uk/info-for/open-data-users/" target="_blank" rel="noopener">Powered by TfL Open Data</a>. ' +
       'Contains OS data © Crown copyright and database rights.',
+  },
+  {
+    key: 'fl511-cctv',
+    html:
+      'CCTV cameras &amp; frames (Florida): FDOT FL511 — ' +
+      '<a href="https://fl511.com/" target="_blank" rel="noopener">fl511.com</a>',
+  },
+  {
+    key: 'drivebc-cctv',
+    html:
+      'CCTV cameras &amp; frames (British Columbia): ' +
+      '<a href="https://www.drivebc.ca" target="_blank" rel="noopener">DriveBC.ca</a> — ' +
+      '<a href="https://www2.gov.bc.ca/gov/content/data/open-data/open-government-licence-bc" target="_blank" rel="noopener">Open Government Licence – British Columbia</a>',
+  },
+  {
+    key: 'world-cctv',
+    html:
+      'World traffic cameras: official 511 / open-data catalogs — Ontario 511, 511NY, WSDOT, ODOT, UDOT, Iowa DOT, LADOTD, HDOT, Illinois DOT/Travel Midwest, TII Ireland, Lyon CRITER, Genève SITG, Toronto, Calgary, Fintraffic, vegvesen, Trafikverket, Vegagerðin, Transpordiamet, Via Lietuva, DATA.GOV.HK, NZTA, TfNSW, Qld TMR, LTA (see docs/CAMERA-CATALOGS.md)',
   },
   {
     key: 'gbfs',

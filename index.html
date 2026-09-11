@@ -643,6 +643,21 @@
     </div>
   </div>
 
+  <!-- NEWS Roster — readable headlines for the News layer; hidden until ON -->
+  <div id="news-roster-panel" class="panel-collapsible collapsed" data-panel-id="news-roster-panel" hidden>
+    <div class="panel-glow"></div>
+    <div class="news-roster-inner">
+      <div class="panel-header">
+        <span class="panel-title">NEWS</span>
+        <span class="panel-divider"></span>
+        <button class="panel-collapse-btn" data-collapse-target="news-roster-panel" title="Collapse panel">+</button>
+      </div>
+      <div id="news-roster-status" class="news-roster-status" role="status" aria-live="polite">News layer is off.</div>
+      <ol id="news-roster-list" class="news-roster-list" aria-label="Latest geolocated world news headlines"></ol>
+      <div class="news-roster-footer">GDELT GKG GEO · geolocated articles only</div>
+    </div>
+  </div>
+
   <!-- Scene Director Panel -->
   <div id="scene-panel" class="panel-collapsible collapsed" data-panel-id="scene-panel">
     <div class="panel-glow"></div>

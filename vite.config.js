@@ -42,6 +42,8 @@ import {
   isOverBudget as isTomTomOverBudget,
 } from './src/data/tomtomTiles.js';
 import { filterTrailing24h, parseFirmsCsv } from './src/data/firmsCsv.js';
+import { parseConflictCsv } from './src/data/conflictsCsv.js';
+import { parseNewsGdeltGeo } from './src/data/newsGdelt.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { defineConfig, loadEnv } from 'vite';
@@ -2230,6 +2232,293 @@ function firmsProxy() {
 }
 
 /**
+ * UCDP Candidate GED conflicts proxy: keyless official dataset download →
+ * parsed JSON at /api/conflicts. Upstream:
+ * https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv (CC BY 4.0)
+ *
+ * The UCDP REST API now requires an emailed access token, so the official
+ * downloads server is the keyless channel — a published dataset fetch, not a
+ * page scrape. The dataset updates monthly, so the cache is the point:
+ * memory + disk (.gev-cache/conflicts.json), TTL 6 h, single-flight refresh,
+ * serve-stale-on-failure. The pinned filename rolls forward with each UCDP
+ * release; while it 404s upstream, the disk cache keeps the layer honestly
+ * stale rather than empty (stale:true in the payload says so).
+ *
+ * Route:
+ *   GET /api/conflicts?limit=N → {fetchedAt, stale, ttlMs, total, count, events}
+ *   (limit clamped 1..2000, default 300; events are the most recent N)
+ *
+ * @returns {import('vite').Plugin}
+ */
+function conflictsProxy() {
+  const TTL_MS = 6 * 3600_000;
+  const UPSTREAM_URL = 'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv';
+  const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
+  const CACHE_PATH = path.join(CACHE_DIR, 'conflicts.json');
+  const DEFAULT_LIMIT = 300;
+  const MAX_LIMIT = 2000;
+
+  /** @type {?{at: number, total: number, events: Array<object>}} */
+  let mem = null;
+  let diskChecked = false;
+  /** @type {?Promise<?{at: number, total: number, events: Array<object>}>} single-flight refresh */
+  let inflight = null;
+
+  async function readDiskOnce() {
+    if (diskChecked) return;
+    diskChecked = true;
+    try {
+      const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
+      if (Number.isFinite(parsed?.at) && Array.isArray(parsed?.events)) {
+        mem = { at: parsed.at, total: parsed.events.length, events: parsed.events };
+      }
+    } catch { /* no disk cache yet */ }
+  }
+
+  async function writeDisk(entry) {
+    try {
+      await fsp.mkdir(CACHE_DIR, { recursive: true });
+      await fsp.writeFile(CACHE_PATH, JSON.stringify(entry), 'utf8');
+    } catch (err) {
+      console.warn('[conflicts-proxy] cache write failed:', err?.message || err);
+    }
+  }
+
+  /** Fetch + parse the published dataset CSV. Throws on HTTP error or an empty/foreign body. */
+  async function refreshUpstream() {
+    const res = await fetch(UPSTREAM_URL, { signal: AbortSignal.timeout(120_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const events = parseConflictCsv(await res.text());
+    if (!events.length) throw new Error('empty or unrecognized UCDP CSV');
+    return { at: Date.now(), total: events.length, events };
+  }
+
+  /** Cache entry → response payload: the `limit` most recent events. */
+  function buildPayload(entry, stale, limit) {
+    const events = entry.events.slice(0, limit);
+    return {
+      fetchedAt: entry.at,
+      stale,
+      ttlMs: TTL_MS,
+      total: entry.events.length,
+      count: events.length,
+      events,
+    };
+  }
+
+  const install = (server) => {
+    server.middlewares.use('/api/conflicts', async (req, res) => {
+      const sendJson = (status, obj) => {
+        if (res.headersSent) return;
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(obj));
+      };
+      try {
+        const query = String(req.url || '').split('?')[1] || '';
+        const asked = Number.parseInt(new URLSearchParams(query).get('limit') || '', 10);
+        const limit = Number.isFinite(asked)
+          ? Math.max(1, Math.min(MAX_LIMIT, asked))
+          : DEFAULT_LIMIT;
+        await readDiskOnce();
+
+        const entry = mem;
+        if (entry && Date.now() - entry.at < TTL_MS) {
+          sendJson(200, buildPayload(entry, false, limit));
+          return;
+        }
+        // Stale or missing → refresh, single-flight (concurrent requests
+        // share one upstream pass). Capture the promise locally BEFORE
+        // awaiting: the .finally() nulls `inflight` the moment it settles.
+        if (!inflight) {
+          inflight = refreshUpstream()
+            .then(async (fresh) => {
+              mem = fresh;
+              await writeDisk(fresh);
+              return fresh;
+            })
+            .catch((err) => {
+              console.warn(`[conflicts-proxy] refresh failed (${err?.message || err}) — serving cache if any`);
+              return null;
+            })
+            .finally(() => { inflight = null; });
+        }
+        const pending = inflight;
+        const fresh = await pending;
+        if (fresh) {
+          sendJson(200, buildPayload(fresh, false, limit));
+        } else if (entry) {
+          sendJson(200, buildPayload(entry, true, limit)); // upstream down — stale beats empty
+        } else {
+          sendJson(502, { error: 'ucdp fetch failed and no cache available' });
+        }
+      } catch (err) {
+        console.warn('[conflicts-proxy] error:', err?.message || err);
+        sendJson(500, { error: 'conflicts proxy error' });
+      }
+    });
+  };
+
+  return {
+    name: 'conflicts-proxy',
+    configureServer: install,
+    configurePreviewServer: install,
+  };
+}
+
+/**
+ * GDELT NEWS layer proxy: keyless GKG GEO API (v1 gkg_geojson) → normalized
+ * article records at /api/news. Upstream:
+ * https://api.gdeltproject.org/api/v1/gkg_geojson?QUERY=…&TIMESPAN=…
+ *
+ * GDELT is the sole source (brief 2026-09-10): no Google News expansion, no
+ * World Monitor feeds, no ACLED, no scraping. The v2 GEO route is dead (404
+ * at path level) and DOC 2.0 is hard-throttled (1 req/5s, 429s during dev),
+ * while the v1 GKG GEO route is the documented live geo endpoint: keyless,
+ * no observed throttle, real per-article coordinates, 2,500 features in 30
+ * minutes of global coverage. It carries no headline field, so titles derive
+ * deterministically from the article URL slug (payload parsing, not a page
+ * fetch); the inspect panel links to the publisher.
+ *
+ * Cache is the point: memory + disk (.gev-cache/news.json), TTL 10 min
+ * (brief: 5–15 min), single-flight refresh, serve-stale-on-failure. Client
+ * pin cap (100) is applied downstream in newsModel, not here.
+ *
+ * Route:
+ *   GET /api/news → {fetchedAt, stale, ttlMs, total, count, articles}
+ *
+ * @returns {import('vite').Plugin}
+ */
+function newsProxy() {
+  const TTL_MS = 10 * 60_000;
+  const UPSTREAM_URL = 'https://api.gdeltproject.org/api/v1/gkg_geojson?QUERY=&TIMESPAN=30';
+  const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
+  const CACHE_PATH = path.join(CACHE_DIR, 'news.json');
+
+  /** @type {?{at: number, articles: Array<object>}} */
+  let mem = null;
+  let diskChecked = false;
+  /** @type {?Promise<?{at: number, articles: Array<object>}>} single-flight refresh */
+  let inflight = null;
+  /** Epoch-ms of the last upstream request — GDELT asks ≥1 req/5s. */
+  let lastUpstreamAt = 0;
+
+  async function readDiskOnce() {
+    if (diskChecked) return;
+    diskChecked = true;
+    try {
+      const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
+      if (Number.isFinite(parsed?.at) && Array.isArray(parsed?.articles)) {
+        mem = { at: parsed.at, articles: parsed.articles };
+      }
+    } catch { /* no disk cache yet */ }
+  }
+
+  async function writeDisk(entry) {
+    try {
+      await fsp.mkdir(CACHE_DIR, { recursive: true });
+      await fsp.writeFile(CACHE_PATH, JSON.stringify(entry), 'utf8');
+    } catch (err) {
+      console.warn('[news-proxy] cache write failed:', err?.message || err);
+    }
+  }
+
+  /** Fetch + parse the GKG GEO feed. Throws on HTTP error or an empty body. */
+  async function refreshUpstream() {
+    // Space upstream requests ≥5s (GDELT policy; DOC 429s below that).
+    const waitMs = lastUpstreamAt ? Math.max(0, 5_000 - (Date.now() - lastUpstreamAt)) : 0;
+    if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    lastUpstreamAt = Date.now();
+    const res = await fetch(UPSTREAM_URL, {
+      signal: AbortSignal.timeout(30_000),
+      headers: { 'User-Agent': 'GodsEyeView/0.1 (news layer)' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await readResponseTextCapped(res, 32 * 1024 * 1024);
+    const articles = parseNewsGdeltGeo(text);
+    if (!articles.length) throw new Error('empty or unrecognized GDELT GEO payload');
+    return { at: Date.now(), articles };
+  }
+
+  const install = (server) => {
+    server.middlewares.use('/api/news', async (req, res) => {
+      const sendJson = (status, obj) => {
+        if (res.headersSent) return;
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.method !== 'GET') {
+        res.writeHead(405, { Allow: 'GET', 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      try {
+        await readDiskOnce();
+        const entry = mem;
+        if (entry && Date.now() - entry.at < TTL_MS) {
+          sendJson(200, {
+            fetchedAt: entry.at,
+            stale: false,
+            ttlMs: TTL_MS,
+            total: entry.articles.length,
+            count: entry.articles.length,
+            articles: entry.articles,
+          });
+          return;
+        }
+        // Stale or missing → refresh, single-flight (concurrent requests
+        // share one upstream pass). Capture the promise locally BEFORE
+        // awaiting: the .finally() nulls `inflight` the moment it settles.
+        if (!inflight) {
+          inflight = refreshUpstream()
+            .then(async (fresh) => {
+              mem = fresh;
+              await writeDisk(fresh);
+              return fresh;
+            })
+            .catch((err) => {
+              console.warn(`[news-proxy] refresh failed (${err?.message || err}) — serving cache if any`);
+              return null;
+            })
+            .finally(() => { inflight = null; });
+        }
+        const pending = inflight;
+        const fresh = await pending;
+        if (fresh) {
+          sendJson(200, {
+            fetchedAt: fresh.at,
+            stale: false,
+            ttlMs: TTL_MS,
+            total: fresh.articles.length,
+            count: fresh.articles.length,
+            articles: fresh.articles,
+          });
+        } else if (entry) {
+          sendJson(200, { // upstream down — stale beats empty
+            fetchedAt: entry.at,
+            stale: true,
+            ttlMs: TTL_MS,
+            total: entry.articles.length,
+            count: entry.articles.length,
+            articles: entry.articles,
+          });
+        } else {
+          sendJson(502, { error: 'gdelt news fetch failed and no cache available' });
+        }
+      } catch (err) {
+        console.warn('[news-proxy] error:', err?.message || err);
+        sendJson(500, { error: 'news proxy error' });
+      }
+    });
+  };
+
+  return {
+    name: 'news-proxy',
+    configureServer: install,
+    configurePreviewServer: install,
+  };
+}
+
+/**
  * Re:Earth terrain point-height proxy: batched lon/lat → ellipsoidal height
  * lookups, keyless. Upstream: https://terrain.reearth.land/heights.json
  * (≤256 points per call). Terrain doesn't move, so results are cached to
@@ -3521,8 +3810,10 @@ const DEFAULT_CCTV_SOURCE_FILE = 'config/cctv_sources.austin.json';
 const DEFAULT_AUSTIN_ROWS_URL = 'https://data.austintexas.gov/api/views/b4k4-adkb/rows.json?accessType=DOWNLOAD';
 /** Default cap on Austin cameras after distance-based prioritization. */
 const DEFAULT_AUSTIN_MAX_SOURCES = 250;
-/** Global cap on total CCTV sources served by the proxy. */
-const DEFAULT_CCTV_MAX_SOURCES = 900;
+/** Global cap on total CCTV sources served by the proxy. Raised from 900 for
+ * the world packs (30 catalogs + FL511 + DriveBC + the original three); env
+ * CCTV_MAX_SOURCES overrides, hard-bounded at 6000. */
+const DEFAULT_CCTV_MAX_SOURCES = 3000;
 /** Reference point for Austin camera prioritization (Congress & 6th). */
 const AUSTIN_DOWNTOWN = { lat: 30.2672, lon: -97.7431 };
 /** Caltrans CCTV: one JSON feed per district, identical schema statewide. */
@@ -3543,6 +3834,61 @@ const TFL_JAMCAM_URL = 'https://api.tfl.gov.uk/Place/Type/JamCam';
 const TFL_IMAGE_ORIGIN = 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/';
 const DEFAULT_TFL_MAX_SOURCES = 250;
 const LONDON_CENTER = { lat: 51.5074, lon: -0.1278 };
+/** FDOT FL511: statewide DataTables list endpoint; frames are keyless JPEG
+ * snapshots on fl511.com. The catalog carries HLS `videoUrl`s too, but they
+ * are all `isVideoAuthRequired: true`, so only the still frames are usable. */
+const FL511_LIST_URL = 'https://fl511.com/List/GetData/Cameras';
+const FL511_IMAGE_ORIGIN = 'https://fl511.com/map/Cctv/';
+/** Upstream hard-caps `length` at 100 regardless of what is requested. */
+const FL511_PAGE_SIZE = 100;
+/** Concurrent page fetches. 49 pages statewide; 6 at a time settles in ~3 s
+ * and stays polite against a public state DOT endpoint. */
+const FL511_PAGE_CONCURRENCY = 6;
+/** Backstop so an upstream recordsTotal blow-up can't fan out unbounded. */
+const FL511_MAX_PAGES = 80;
+/** Transient-failure retries per page (empty 200s / 5xx are common under load). */
+const FL511_PAGE_RETRIES = 3;
+const DEFAULT_FL511_MAX_SOURCES = 250;
+/** Default region: Miami-Dade + Broward. "minLat,minLon,maxLat,maxLon";
+ * an empty CCTV_FL511_BBOX takes the whole state (~4,870 cameras). */
+const DEFAULT_FL511_BBOX = '25.30,-80.60,26.40,-80.00';
+/** Cap anchors: the Miami-Dade core, so the default 250 lands on Miami rather
+ * than being spread thin up the Broward corridor. */
+const FL511_ANCHORS = [
+  { lat: 25.7743, lon: -80.1937 }, // Downtown Miami
+  { lat: 25.7907, lon: -80.1300 }, // Miami Beach
+  { lat: 25.7959, lon: -80.2870 }, // Miami International Airport
+];
+/** FL511 `areaId` -> display city. Anything else falls back to Florida. */
+const FL511_AREA_CITIES = {
+  MDC: { city: 'Miami', cityId: 'miami' },
+  BC: { city: 'Fort Lauderdale', cityId: 'fort-lauderdale' },
+  PBC: { city: 'West Palm Beach', cityId: 'west-palm-beach' },
+};
+/** DriveBC: one keyless JSON catalog, frames on the same host. Unlike every
+ * other pack, BC publishes a compass `orientation` AND an `elevation` for every
+ * camera, so headings are real rather than inferred. Licence: Open Government
+ * Licence – British Columbia (redistribution permitted with attribution). */
+const DRIVEBC_CATALOG_URL = 'https://www.drivebc.ca/api/webcams/';
+const DRIVEBC_IMAGE_ORIGIN = 'https://www.drivebc.ca/images/';
+const DEFAULT_DRIVEBC_MAX_SOURCES = 300;
+/** Default regions: the Vancouver metro area plus the Island. DriveBC's own
+ * region names; an empty CCTV_DRIVEBC_REGIONS takes all of BC (~1,060). */
+const DEFAULT_DRIVEBC_REGIONS = 'Lower Mainland,Vancouver Island';
+/** DriveBC's `orientation` is a bare compass CODE ("W", "NE"), not travel text.
+ * directionToHeading() matches travel words and the two-letter intercardinals,
+ * so NE/NW/SE/SW resolve there but the single letters N/S/E/W do not — they are
+ * mapped here instead. Without this, 96% of BC cameras silently fall back to a
+ * fabricated heading despite publishing a real one. */
+const DRIVEBC_ORIENTATION_DEGREES = {
+  N: 0, NE: 45, E: 90, SE: 135, S: 180, SW: 225, W: 270, NW: 315,
+};
+const DRIVEBC_ANCHORS = [
+  { lat: 49.2827, lon: -123.1207 }, // Downtown Vancouver
+  { lat: 49.3200, lon: -123.0700 }, // North Vancouver / North Shore
+  { lat: 49.1913, lon: -122.8490 }, // Surrey
+  { lat: 48.4284, lon: -123.3656 }, // Victoria
+];
 /** Camera CATALOGS change rarely; 15 min keeps multi-megabyte upstream list refetches (Austin rows.json + 4 Caltrans districts + TfL) infrequent. Frames are fetched per-request and are unaffected. */
 const CCTV_SOURCE_CACHE_MS = 15 * 60 * 1000;
 /** Per-provider catalog-fetch timeout. Bounds the worst-case refresh so one
@@ -4169,6 +4515,637 @@ async function loadTflSourcesFromOpenData() {
 }
 
 /**
+ * Parse a WKT POINT string ("POINT(lon lat)") into {lat, lon}.
+ *
+ * @param {string} wkt
+ * @returns {{lat:number,lon:number}|null} Null when not a finite POINT.
+ */
+function parseWktPoint(wkt) {
+  const match = /POINT\s*\(\s*(-?[\d.]+)\s+(-?[\d.]+)\s*\)/i.exec(String(wkt || ''));
+  if (!match) return null;
+  const lon = toFiniteNumber(match[1], NaN);
+  const lat = toFiniteNumber(match[2], NaN);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon };
+}
+
+/**
+ * Parse CCTV_FL511_BBOX ("minLat,minLon,maxLat,maxLon").
+ *
+ * @param {string} raw
+ * @returns {{minLat:number,minLon:number,maxLat:number,maxLon:number}|null}
+ *   Null for an empty/malformed value, meaning "no bbox filter" (statewide).
+ */
+function parseFl511Bbox(raw) {
+  const parts = String(raw ?? '').split(',').map((token) => Number(token.trim()));
+  if (parts.length !== 4 || !parts.every((n) => Number.isFinite(n))) return null;
+  const [minLat, minLon, maxLat, maxLon] = parts;
+  if (minLat >= maxLat || minLon >= maxLon) return null;
+  return { minLat, minLon, maxLat, maxLon };
+}
+
+/**
+ * Fetch one page of the FL511 camera list.
+ *
+ * The endpoint is a DataTables server-side handler: it only answers POSTed
+ * form bodies, ignores `length` above 100, and needs the X-Requested-With
+ * header. `search[value]` matches roadway/location text only — there is no
+ * server-side region filter, which is why the bbox is applied client-side.
+ *
+ * @param {number} start - Row offset.
+ * @returns {Promise<{rows: Array<object>, total: number}>}
+ */
+async function fetchFl511Page(start, attempt = 0) {
+  const body = new URLSearchParams({
+    draw: '1',
+    start: String(start),
+    length: String(FL511_PAGE_SIZE),
+    'columns[0][data]': 'roadway',
+    'order[0][column]': '0',
+    'order[0][dir]': 'asc',
+    'search[value]': '',
+    'search[regex]': 'false',
+  });
+  const resp = await fetch(FL511_LIST_URL, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'X-Requested-With': 'XMLHttpRequest',
+    },
+    body: body.toString(),
+    signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+  });
+  // Under load the endpoint intermittently answers 200 with an EMPTY body (and
+  // occasionally 5xx). Both are transient: the same offset succeeds on a retry,
+  // and without one a handful of pages drop out of every catalog refresh, so the
+  // camera count visibly wobbles run to run. Retry with a short backoff before
+  // letting the page fail and thin the pack.
+  const text = resp.ok ? await resp.text() : '';
+  if (!resp.ok || !text.trim()) {
+    if (attempt < FL511_PAGE_RETRIES) {
+      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      return fetchFl511Page(start, attempt + 1);
+    }
+    throw new Error(`FL511 start=${start} ${resp.ok ? 'empty body' : `HTTP ${resp.status}`} after ${FL511_PAGE_RETRIES + 1} tries`);
+  }
+  const payload = JSON.parse(text);
+  return {
+    rows: Array.isArray(payload?.data) ? payload.data : [],
+    total: toFiniteNumber(payload?.recordsTotal, 0),
+  };
+}
+
+/**
+ * Fetch FDOT FL511 traffic cameras (Florida), filtered to CCTV_FL511_BBOX —
+ * Miami-Dade + Broward by default. Keyless: the catalog and the JPEG frames
+ * are both public. Disable with CCTV_FL511_ENABLED=0.
+ *
+ * Page 0 is fetched first for `recordsTotal`, then the remaining pages go out
+ * in bounded-concurrency batches. Pages fail independently (Promise.allSettled)
+ * so one bad page thins the catalog instead of darkening the pack. Only rows
+ * with finite coords inside the bbox and an enabled image on the official
+ * fl511.com path are kept (origin pin is defence-in-depth, matching Caltrans).
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadFl511SourcesFromOpenData() {
+  if (String(process.env.CCTV_FL511_ENABLED || '1').trim() === '0') return [];
+
+  const bbox = parseFl511Bbox(process.env.CCTV_FL511_BBOX ?? DEFAULT_FL511_BBOX);
+  const first = await fetchFl511Page(0);
+  const rows = [...first.rows];
+  const pageCount = Math.min(Math.ceil(first.total / FL511_PAGE_SIZE) || 1, FL511_MAX_PAGES);
+
+  for (let page = 1; page < pageCount; page += FL511_PAGE_CONCURRENCY) {
+    const batch = [];
+    for (let offset = 0; offset < FL511_PAGE_CONCURRENCY && page + offset < pageCount; offset += 1) {
+      batch.push(fetchFl511Page((page + offset) * FL511_PAGE_SIZE));
+    }
+    const settled = await Promise.allSettled(batch);
+    for (const result of settled) {
+      if (result.status === 'fulfilled') rows.push(...result.value.rows);
+      else console.warn('[CCTV] FL511 page fetch failed:', result.reason?.message || result.reason);
+    }
+  }
+
+  const cameras = [];
+  for (const row of rows) {
+    const point = parseWktPoint(row?.latLng?.geography?.wellKnownText);
+    if (!point) continue;
+    if (bbox && (point.lat < bbox.minLat || point.lat > bbox.maxLat
+      || point.lon < bbox.minLon || point.lon > bbox.maxLon)) continue;
+
+    const image = Array.isArray(row?.images) ? row.images[0] : null;
+    if (!image || image.disabled || image.blocked) continue;
+    const imagePath = String(image.imageUrl || '');
+    // Official-path pin (see JSDoc). Also drops records with no still image.
+    if (!imagePath.startsWith('/map/Cctv/')) continue;
+    const imageUrl = `${FL511_IMAGE_ORIGIN}${imagePath.slice('/map/Cctv/'.length)}`;
+
+    const siteId = String(row.id ?? '').trim();
+    if (!siteId) continue;
+    const cameraId = `fl-${siteId}`;
+
+    // `direction` is a dedicated field ("Northbound", "Eastbound") → allow bare.
+    const heading = directionToHeading(row.direction, true);
+    const hasHeading = Number.isFinite(heading);
+    const area = FL511_AREA_CITIES[String(row.areaId || '').trim().toUpperCase()]
+      || { city: 'Florida', cityId: 'florida' };
+    const label = String(row.location || '').trim()
+      || [row.roadway, row.direction].filter(Boolean).join(' ')
+      || `FL511 ${siteId}`;
+
+    cameras.push({
+      id: cameraId,
+      name: label,
+      city: area.city,
+      cityId: area.cityId,
+      provider: 'FDOT FL511',
+      lat: point.lat,
+      lon: point.lon,
+      headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
+      headingConfidence: hasHeading ? 'high' : 'low',
+      // Same two fabricated pose personalities as Austin/Caltrans: RAW PRIORS
+      // only — the client's one-shot ground snap and manual calibration own
+      // the truth.
+      pitchDeg: hasHeading ? -24 : -18,
+      fovDeg: hasHeading ? 56 : 44,
+      rangeM: hasHeading ? 210 : 145,
+      mountHeightM: hasHeading ? 10 : 8,
+      // FL511 publishes no elevation. South Florida is flat and near sea level
+      // (Miami-Dade tops out around 8 m), so a small constant is a safer prior
+      // than a fabricated per-camera value on a keyless no-tileset stack.
+      groundElevationM: 3,
+      feedType: 'image',
+      url: imageUrl,
+      snapshotUrl: imageUrl,
+      sourceKind: 'fl511-open-data',
+      license: 'Public FDOT FL511 traffic camera frame',
+    });
+  }
+
+  // FL511's published coordinates are not reliable: some statewide records
+  // repeat another camera's exact lat/lon. A wrong position is worse here than
+  // a vague one — the client projects a view cone from it — so any camera
+  // sharing coordinates with another is demoted to a low-confidence pose,
+  // which routes it to the conservative pose prior and flags it for
+  // calibration instead of asserting a bogus heading.
+  const coordinateCounts = new Map();
+  for (const camera of cameras) {
+    const key = `${camera.lat.toFixed(6)},${camera.lon.toFixed(6)}`;
+    coordinateCounts.set(key, (coordinateCounts.get(key) || 0) + 1);
+  }
+  let demoted = 0;
+  for (const camera of cameras) {
+    const key = `${camera.lat.toFixed(6)},${camera.lon.toFixed(6)}`;
+    if (coordinateCounts.get(key) <= 1) continue;
+    demoted += 1;
+    camera.headingConfidence = 'low';
+    camera.pitchDeg = -18;
+    camera.fovDeg = 44;
+    camera.rangeM = 145;
+    camera.mountHeightM = 8;
+  }
+  if (demoted) {
+    console.warn(`[CCTV] FL511: ${demoted} cameras share coordinates with another camera; demoted to low-confidence pose (upstream catalog defect).`);
+  }
+
+  const maxRaw = Number(process.env.CCTV_FL511_MAX_SOURCES || DEFAULT_FL511_MAX_SOURCES);
+  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(900, Math.floor(maxRaw))) : DEFAULT_FL511_MAX_SOURCES;
+  const prioritized = prioritizeSources(cameras, maxCount, FL511_ANCHORS);
+  console.log(`[CCTV] Loaded FL511 camera sources: ${cameras.length} in region (using nearest ${prioritized.length})`);
+  return prioritized;
+}
+
+/**
+ * Fetch DriveBC highway webcams (British Columbia), filtered to
+ * CCTV_DRIVEBC_REGIONS — Lower Mainland + Vancouver Island by default.
+ * Keyless: one JSON catalog, frames on the same host. Disable with
+ * CCTV_DRIVEBC_ENABLED=0.
+ *
+ * This is the only pack whose poses are not fabricated. DriveBC publishes a
+ * compass `orientation` and a metre `elevation` for all cameras, so
+ * headingConfidence is genuinely high and groundElevationM is a real
+ * measurement rather than a regional guess.
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadDriveBcSourcesFromOpenData() {
+  if (String(process.env.CCTV_DRIVEBC_ENABLED || '1').trim() === '0') return [];
+
+  const resp = await fetch(DRIVEBC_CATALOG_URL, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+  });
+  if (!resp.ok) throw new Error(`DriveBC HTTP ${resp.status}`);
+  const rows = await resp.json();
+  if (!Array.isArray(rows)) throw new Error('DriveBC catalog is not an array');
+
+  const regionsRaw = process.env.CCTV_DRIVEBC_REGIONS ?? DEFAULT_DRIVEBC_REGIONS;
+  const regions = new Set(
+    String(regionsRaw).split(',').map((token) => token.trim().toLowerCase()).filter(Boolean)
+  );
+
+  const cameras = [];
+  for (const row of rows) {
+    // `is_on` false is a camera DriveBC has deliberately taken out of service.
+    if (row?.is_on === false) continue;
+    if (regions.size && !regions.has(String(row?.region_name || '').trim().toLowerCase())) continue;
+
+    const coords = row?.location?.coordinates;
+    if (!Array.isArray(coords) || coords.length < 2) continue;
+    const lon = toFiniteNumber(coords[0], NaN);
+    const lat = toFiniteNumber(coords[1], NaN);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+    const cameraId = `bc-${row.id}`;
+    const orientation = String(row.orientation || '').trim().toUpperCase();
+    const heading = DRIVEBC_ORIENTATION_DEGREES[orientation] ?? directionToHeading(orientation, true);
+    const hasHeading = Number.isFinite(heading);
+
+    // Stale/delayed are DriveBC's own freshness flags; surface them rather than
+    // presenting a frozen frame as current.
+    const staleNote = row?.marked_stale
+      ? ' (DriveBC reports this camera stale)'
+      : (row?.marked_delayed ? ' (DriveBC reports this camera delayed)' : '');
+
+    cameras.push({
+      id: cameraId,
+      name: String(row.name_override || row.name || cameraId).trim(),
+      city: String(row.region_name || 'British Columbia'),
+      cityId: `bc-${String(row.region_name || 'bc').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      provider: 'DriveBC',
+      lat,
+      lon,
+      headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
+      // Real published orientation, not an inferred prior — the only pack that
+      // can honestly claim this.
+      headingConfidence: hasHeading ? 'high' : 'low',
+      pitchDeg: hasHeading ? -22 : -18,
+      fovDeg: hasHeading ? 58 : 44,
+      rangeM: hasHeading ? 260 : 145,
+      mountHeightM: hasHeading ? 9 : 8,
+      // DriveBC publishes elevation in METRES. Clamped so one bad row can't
+      // fling a camera into orbit.
+      groundElevationM: (() => {
+        const m = toFiniteNumber(row.elevation, NaN);
+        return Number.isFinite(m) ? Math.max(-50, Math.min(3000, m)) : 100;
+      })(),
+      feedType: 'image',
+      url: `${DRIVEBC_IMAGE_ORIGIN}${encodeURIComponent(row.id)}.jpg`,
+      snapshotUrl: `${DRIVEBC_IMAGE_ORIGIN}${encodeURIComponent(row.id)}.jpg`,
+      sourceKind: 'drivebc-open-data',
+      license: `DriveBC.ca — Open Government Licence – British Columbia${staleNote}`,
+    });
+  }
+
+  const maxRaw = Number(process.env.CCTV_DRIVEBC_MAX_SOURCES || DEFAULT_DRIVEBC_MAX_SOURCES);
+  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(1200, Math.floor(maxRaw))) : DEFAULT_DRIVEBC_MAX_SOURCES;
+  const prioritized = prioritizeSources(cameras, maxCount, DRIVEBC_ANCHORS);
+  console.log(`[CCTV] Loaded DriveBC camera sources: ${cameras.length} in region (using nearest ${prioritized.length})`);
+  return prioritized;
+}
+
+// ---------------------------------------------------------------------------
+// Generic world camera-catalog adapter
+// ---------------------------------------------------------------------------
+/** Declarative registry of third-party camera catalogs (see loadWorldCatalogSources). */
+const DEFAULT_WORLD_CATALOG_FILE = 'config/cctv_catalogs.json';
+/** Per-catalog cap. Deliberately modest: this pack can span dozens of countries,
+ * so the global CCTV_MAX_SOURCES is the real budget and each catalog takes a slice. */
+const DEFAULT_WORLD_MAX_PER_CATALOG = 120;
+/** DataTables-style catalogs hard-cap page size at 100 regardless of what is asked. */
+const WORLD_DATATABLES_PAGE_SIZE = 100;
+/** Backstop against an upstream recordsTotal blow-up. */
+const WORLD_MAX_PAGES = 60;
+
+/**
+ * Minimal XML record extractor for camera catalogs.
+ *
+ * Deliberately not a general XML parser: camera catalogs that ship XML are flat
+ * lists of one record tag whose children are leaf text nodes (Hong Kong's
+ * `<image>`, NZTA's `<camera>`). Parsing exactly that shape avoids taking on an
+ * XML dependency for two sources.
+ *
+ * Handles CDATA and the five predefined entities. Repeated child tags keep the
+ * FIRST occurrence, matching how the JSON catalogs' `.0.` paths behave.
+ *
+ * @param {string} xml - Raw XML document.
+ * @param {string} recordTag - Element name that delimits one camera.
+ * @returns {Array<object>} One flat object per record.
+ */
+function parseXmlRecords(xml, recordTag) {
+  const safeTag = String(recordTag).replace(/[^A-Za-z0-9_:.-]/g, '');
+  if (!safeTag) return [];
+  const records = [];
+  const recordPattern = new RegExp(`<${safeTag}(?:\\s[^>]*)?>([\\s\\S]*?)</${safeTag}>`, 'g');
+  const decode = (raw) => String(raw)
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .trim();
+
+  let match = recordPattern.exec(xml);
+  while (match) {
+    const body = match[1];
+    const record = {};
+    // Flatten nested elements too: Madrid's M-30 feed wraps coordinates as
+    // <Posicion><Latitud>…</Latitud></Posicion>, and a single non-recursive pass
+    // consumes the whole <Posicion> block and never sees Latitud at all.
+    const collect = (fragment) => {
+      const fieldPattern = /<([A-Za-z0-9_:.-]+)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g;
+      let field = fieldPattern.exec(fragment);
+      while (field) {
+        const [, tag, value] = field;
+        if (/<[A-Za-z]/.test(value)) collect(value);
+        else if (!(tag in record)) record[tag] = decode(value);
+        field = fieldPattern.exec(fragment);
+      }
+    };
+    collect(body);
+    if (Object.keys(record).length) records.push(record);
+    match = recordPattern.exec(xml);
+  }
+  return records;
+}
+
+/**
+ * Read a dotted path out of a record, supporting array indexes.
+ *
+ * "geometry.coordinates.1" → record.geometry.coordinates[1]
+ * "" or null → undefined
+ *
+ * @param {object} source
+ * @param {string|null} path
+ * @returns {*} The value, or undefined if any segment is missing.
+ */
+function pluckPath(source, path) {
+  if (!path) return undefined;
+  let cursor = source;
+  for (const segment of String(path).split('.')) {
+    if (cursor === null || cursor === undefined) return undefined;
+    cursor = cursor[segment];
+  }
+  return cursor;
+}
+
+/**
+ * Substitute {field} placeholders in a URL template from a record.
+ * Values are URI-encoded, so a template is never an injection point.
+ *
+ * @param {string} template - e.g. "https://host/cam/{id}.jpg"
+ * @param {object} record
+ * @param {object} fields - Catalog field map (template keys resolve through it).
+ * @returns {string}
+ */
+function applyUrlTemplate(template, record, fields) {
+  return String(template).replace(/\{(\w+)\}/g, (_match, key) => {
+    const raw = pluckPath(record, fields?.[key] || key);
+    return encodeURIComponent(raw === undefined || raw === null ? '' : String(raw));
+  });
+}
+
+/**
+ * Fetch every row of one catalog, following its pagination mode.
+ *
+ * Supported modes:
+ *   null / absent  — one request, the whole catalog
+ *   'datatables'   — the 511-family POST endpoint, 100 rows/page
+ *
+ * @param {object} catalog - Registry entry.
+ * @returns {Promise<Array<object>>}
+ */
+async function fetchWorldCatalogRows(catalog) {
+  const requestOnce = async (extraBody) => {
+    const init = {
+      method: catalog.method === 'POST' ? 'POST' : 'GET',
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'gods-eye-view-cctv-proxy/1.0',
+        ...(catalog.headers || {}),
+      },
+      signal: AbortSignal.timeout(CCTV_SOURCE_FETCH_TIMEOUT_MS),
+    };
+    if (init.method === 'POST') {
+      init.headers['Content-Type'] = catalog.contentType || 'application/x-www-form-urlencoded';
+      init.body = extraBody ?? catalog.body ?? '';
+    }
+    const resp = await fetch(catalog.catalogUrl, init);
+    if (!resp.ok) throw new Error(`${catalog.id} HTTP ${resp.status}`);
+    const text = await resp.text();
+    if (!text.trim()) throw new Error(`${catalog.id} empty body`);
+    if (catalog.format === 'xml') return parseXmlRecords(text, catalog.recordTag || 'item');
+    return JSON.parse(text);
+  };
+
+  const pagination = catalog.pagination;
+  if (!pagination || pagination.mode !== 'datatables') {
+    const payload = await requestOnce();
+    // parseXmlRecords already returns the flat record array, so arrayPath is a
+    // JSON-only concept.
+    const rows = (catalog.format !== 'xml' && catalog.arrayPath)
+      ? pluckPath(payload, catalog.arrayPath)
+      : payload;
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  // DataTables: page 0 first for the total, then the rest sequentially. These
+  // endpoints intermittently answer 200 with an empty body, so each page gets
+  // retries — without them a handful of pages silently drop every refresh.
+  const pageBody = (start) => String(catalog.body || '').replace(/(^|&)start=\d+/, `$1start=${start}`);
+  const fetchPage = async (start) => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await requestOnce(pageBody(start));
+      } catch (err) {
+        if (attempt === 2) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      }
+    }
+    return null;
+  };
+
+  const first = await fetchPage(0);
+  const rowsOf = (payload) => {
+    const rows = catalog.arrayPath ? pluckPath(payload, catalog.arrayPath) : payload;
+    return Array.isArray(rows) ? rows : [];
+  };
+  const all = [...rowsOf(first)];
+  const total = toFiniteNumber(pluckPath(first, pagination.totalPath || 'recordsTotal'), all.length);
+  const pageCount = Math.min(Math.ceil(total / WORLD_DATATABLES_PAGE_SIZE) || 1, WORLD_MAX_PAGES);
+  for (let page = 1; page < pageCount; page += 1) {
+    const payload = await fetchPage(page * WORLD_DATATABLES_PAGE_SIZE);
+    all.push(...rowsOf(payload));
+  }
+  return all;
+}
+
+/**
+ * Load every catalog in the world registry and normalize it into camera sources.
+ *
+ * This is the scaling seam for global coverage: a new country is a JSON entry in
+ * config/cctv_catalogs.json (URL + field paths + licence), not a new loader.
+ * Catalogs fail independently, so one dead national road authority never
+ * darkens the rest of the world.
+ *
+ * Env:
+ *   CCTV_WORLD_ENABLED=0            disable the whole pack
+ *   CCTV_WORLD_CATALOGS=de,fi,sg    comma-separated ids/countries to include (default: all)
+ *   CCTV_WORLD_MAX_PER_CATALOG=120  per-catalog cap
+ *   CCTV_WORLD_CATALOG_FILE=...     alternative registry path
+ *
+ * @returns {Promise<Array<object>>} Normalized camera source objects.
+ */
+async function loadWorldCatalogSources() {
+  if (String(process.env.CCTV_WORLD_ENABLED || '1').trim() === '0') return [];
+
+  const file = process.env.CCTV_WORLD_CATALOG_FILE || DEFAULT_WORLD_CATALOG_FILE;
+  let registry = [];
+  try {
+    const raw = fs.readFileSync(path.resolve(__dirname, file), 'utf8');
+    registry = JSON.parse(raw);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') console.warn('[CCTV] world catalog registry unreadable:', err?.message || err);
+    return [];
+  }
+  if (!Array.isArray(registry)) return [];
+
+  const only = String(process.env.CCTV_WORLD_CATALOGS || '')
+    .split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+  const active = registry.filter((c) => {
+    if (!c || c.enabled === false) return false;
+    if (!only.length) return true;
+    return only.includes(String(c.id).toLowerCase()) || only.includes(String(c.country).toLowerCase());
+  });
+  if (!active.length) return [];
+
+  const maxRaw = Number(process.env.CCTV_WORLD_MAX_PER_CATALOG || DEFAULT_WORLD_MAX_PER_CATALOG);
+  const perCatalogMax = Number.isFinite(maxRaw)
+    ? Math.max(4, Math.min(900, Math.floor(maxRaw)))
+    : DEFAULT_WORLD_MAX_PER_CATALOG;
+
+  const settled = await Promise.allSettled(active.map(async (catalog) => {
+    const rows = await fetchWorldCatalogRows(catalog);
+    const fields = catalog.fields || {};
+    const cameras = [];
+
+    for (const row of rows) {
+      // Two coordinate encodings in the wild: discrete lat/lon fields, and a WKT
+      // POINT string (the 511 DataTables family nests one at
+      // latLng.geography.wellKnownText). `fields.wkt` selects the latter.
+      let lat = NaN;
+      let lon = NaN;
+      if (fields.wkt) {
+        const point = parseWktPoint(pluckPath(row, fields.wkt));
+        if (point) {
+          lat = point.lat;
+          lon = point.lon;
+        }
+      } else {
+        lat = toFiniteNumber(pluckPath(row, fields.lat), NaN);
+        lon = toFiniteNumber(pluckPath(row, fields.lon), NaN);
+      }
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      // A catalog that reports 0,0 for unplaced cameras would otherwise drop a
+      // pile of markers into the Gulf of Guinea.
+      if (lat === 0 && lon === 0) continue;
+
+      let imageUrl = '';
+      if (catalog.imageUrlTemplate) {
+        imageUrl = applyUrlTemplate(catalog.imageUrlTemplate, row, fields);
+      } else {
+        const raw = pluckPath(row, fields.imageUrl);
+        if (typeof raw === 'string') imageUrl = raw;
+      }
+      // Several agencies wrap the URL in HTML (Calgary ships
+      // '<a href="...">Camera 38</a>'), so allow a per-catalog extractor.
+      if (imageUrl && catalog.imageUrlRegex) {
+        const match = new RegExp(catalog.imageUrlRegex).exec(imageUrl);
+        imageUrl = match ? (match[1] ?? match[0]) : '';
+      }
+      // Catalogs are untidy about URL hygiene: protocol-relative values and
+      // trailing spaces appear in the wild.
+      imageUrl = imageUrl.trim();
+      if (imageUrl.startsWith('//')) imageUrl = `https:${imageUrl}`;
+      if (!imageUrl) continue;
+      // Relative image paths come in both forms: rooted ('/images/1.jpg', 511NY)
+      // and bare ('94/94_202608250811.jpg', Estonia). Resolve either against
+      // imageBaseUrl — matching only the rooted form silently dropped every
+      // Estonian camera.
+      if (catalog.imageBaseUrl && !/^https?:\/\//i.test(imageUrl)) {
+        const base = String(catalog.imageBaseUrl).replace(/\/+$/, '');
+        imageUrl = `${base}/${imageUrl.replace(/^\/+/, '')}`;
+      }
+      // Oregon's filenames carry raw spaces, which several HTTP clients reject.
+      imageUrl = imageUrl.replace(/ /g, '%20');
+      // Utah and Calgary publish http:// URLs; upgrade so a https page can load
+      // them without mixed-content blocking.
+      if (imageUrl.startsWith('http://')) imageUrl = `https://${imageUrl.slice(7)}`;
+      if (!/^https?:\/\//i.test(imageUrl)) continue;
+      // Some catalogs aggregate several agencies onto one layer and only part of
+      // it is reachable (Illinois mixes cctv.travelmidwest.com with
+      // lakecountypassage.com, which times out). imageUrlPrefix keeps the
+      // dependable subset rather than seeding the map with dead cameras.
+      if (catalog.imageUrlPrefix && !imageUrl.toLowerCase().startsWith(String(catalog.imageUrlPrefix).toLowerCase())) continue;
+
+      const rawId = pluckPath(row, fields.id);
+      const localId = String(rawId ?? `${lat.toFixed(5)},${lon.toFixed(5)}`).trim();
+      if (!localId) continue;
+
+      const heading = directionToHeading(pluckPath(row, fields.heading), true);
+      const hasHeading = Number.isFinite(heading);
+      const elevation = toFiniteNumber(pluckPath(row, fields.elevation), NaN);
+      const cameraId = `${catalog.id}-${localId}`;
+
+      cameras.push({
+        id: cameraId,
+        name: String(pluckPath(row, fields.name) ?? localId).trim() || localId,
+        city: String(catalog.countryName || catalog.country || 'World'),
+        cityId: String(catalog.id),
+        provider: String(catalog.provider || catalog.id),
+        lat,
+        lon,
+        headingDeg: hasHeading ? heading : fallbackHeadingFromId(cameraId),
+        headingConfidence: hasHeading ? 'high' : 'low',
+        pitchDeg: hasHeading ? -22 : -18,
+        fovDeg: hasHeading ? 56 : 44,
+        rangeM: hasHeading ? 220 : 145,
+        mountHeightM: hasHeading ? 9 : 8,
+        groundElevationM: Number.isFinite(elevation) ? Math.max(-100, Math.min(4000, elevation)) : 50,
+        feedType: 'image',
+        url: imageUrl,
+        snapshotUrl: imageUrl,
+        sourceKind: `world-${catalog.id}`,
+        license: String(catalog.license || 'Licence not published by the operator'),
+      });
+    }
+
+    const anchors = Array.isArray(catalog.anchors) && catalog.anchors.length
+      ? catalog.anchors
+      : [{ lat: cameras[0]?.lat ?? 0, lon: cameras[0]?.lon ?? 0 }];
+    const cap = Number.isFinite(catalog.maxSources)
+      ? Math.max(4, Math.min(perCatalogMax, catalog.maxSources))
+      : perCatalogMax;
+    const prioritized = prioritizeSources(cameras, cap, anchors);
+    console.log(`[CCTV] world/${catalog.id} (${catalog.countryName || catalog.country}): ${cameras.length} usable (using nearest ${prioritized.length})`);
+    return prioritized;
+  }));
+
+  const out = [];
+  for (let i = 0; i < settled.length; i += 1) {
+    const result = settled[i];
+    if (result.status === 'fulfilled') out.push(...result.value);
+    else console.warn(`[CCTV] world/${active[i].id} failed:`, result.reason?.message || result.reason);
+  }
+  console.log(`[CCTV] Loaded world catalog sources: ${out.length} cameras from ${active.length} catalogs`);
+  return out;
+}
+
+/**
  * Normalize a raw CCTV source item into a canonical shape with safe defaults.
  *
  * @param {object} item - Raw source from file, env, or Austin Open Data.
@@ -4239,27 +5216,37 @@ async function refreshCctvSources() {
 
   const forceAustin = String(process.env.CCTV_FORCE_AUSTIN || '').trim() === '1';
   const preferAustin = String(process.env.CCTV_PREFER_AUSTIN || '1').trim() !== '0';
-  // Live open-data packs (Austin + Caltrans + TfL) load unless a file/env pack
-  // is configured and live packs aren't forced — same gate that governed the
-  // Austin-only fetch, now governing all three. Each pack fails independently.
+  // Live open-data packs (Austin + Caltrans + TfL + FL511 + DriveBC + world
+  // catalogs) load unless a file/env pack is configured and live packs aren't
+  // forced — same gate that governed the Austin-only fetch, now governing all
+  // six. Each pack fails independently.
   const needsLiveSources = forceAustin || ((fromFile.length + fromEnv.length) === 0 && preferAustin);
   const tflEnabled = String(process.env.CCTV_TFL_ENABLED || '1').trim() !== '0';
 
   let fromAustin = [];
   let fromCaltrans = [];
   let fromTfl = [];
+  let fromFl511 = [];
+  let fromDriveBc = [];
+  let fromWorld = [];
   if (needsLiveSources) {
-    const [austinResult, caltransResult, tflResult] = await Promise.allSettled([
+    const [austinResult, caltransResult, tflResult, fl511Result, driveBcResult, worldResult] = await Promise.allSettled([
       loadAustinSourcesFromOpenData(),
       loadCaltransSourcesFromOpenData(),
       tflEnabled ? loadTflSourcesFromOpenData() : Promise.resolve([]),
+      loadFl511SourcesFromOpenData(),
+      loadDriveBcSourcesFromOpenData(),
+      loadWorldCatalogSources(),
     ]);
     fromAustin = austinResult.status === 'fulfilled' ? austinResult.value : [];
     fromCaltrans = caltransResult.status === 'fulfilled' ? caltransResult.value : [];
     fromTfl = tflResult.status === 'fulfilled' ? tflResult.value : [];
+    fromFl511 = fl511Result.status === 'fulfilled' ? fl511Result.value : [];
+    fromDriveBc = driveBcResult.status === 'fulfilled' ? driveBcResult.value : [];
+    fromWorld = worldResult.status === 'fulfilled' ? worldResult.value : [];
   }
   // Live sources first so file/env overrides win on duplicate IDs (Map last-write).
-  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromFile, ...fromEnv];
+  const merged = [...fromAustin, ...fromCaltrans, ...fromTfl, ...fromFl511, ...fromDriveBc, ...fromWorld, ...fromFile, ...fromEnv];
 
   // Deduplicate by camera ID (last-write wins because of Map.set)
   const byId = new Map();
@@ -4272,11 +5259,21 @@ async function refreshCctvSources() {
 
   const mergedSources = Array.from(byId.values());
   const maxRaw = Number(process.env.CCTV_MAX_SOURCES || DEFAULT_CCTV_MAX_SOURCES);
-  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(1200, Math.floor(maxRaw))) : DEFAULT_CCTV_MAX_SOURCES;
+  const maxCount = Number.isFinite(maxRaw) ? Math.max(8, Math.min(6000, Math.floor(maxRaw))) : DEFAULT_CCTV_MAX_SOURCES;
+  // Hand-authored file/env cameras are protected from the global cap. They are
+  // last in merge order (so they win ID collisions), which previously made them
+  // the FIRST thing a slice() dropped — a curated, individually-verified camera
+  // being evicted by bulk highway imports is exactly backwards. Keep every
+  // curated entry, then spend the remaining budget on the bulk packs.
+  let capped = mergedSources;
   if (mergedSources.length > maxCount) {
-    console.warn(`[CCTV] source catalog ${mergedSources.length} exceeds cap ${maxCount}; keeping the first ${maxCount} (raise CCTV_MAX_SOURCES or lower a per-pack cap to change which).`);
+    const curatedIds = new Set([...fromFile, ...fromEnv].map((item) => item?.id).filter(Boolean));
+    const curated = mergedSources.filter((item) => curatedIds.has(item.id));
+    const bulk = mergedSources.filter((item) => !curatedIds.has(item.id));
+    const budget = Math.max(0, maxCount - curated.length);
+    capped = [...bulk.slice(0, budget), ...curated];
+    console.warn(`[CCTV] source catalog ${mergedSources.length} exceeds cap ${maxCount}; kept all ${curated.length} curated cameras + the first ${budget} bulk (raise CCTV_MAX_SOURCES or lower a per-pack cap to change which).`);
   }
-  const capped = mergedSources.length > maxCount ? mergedSources.slice(0, maxCount) : mergedSources;
   if (capped.length > 0 || _cctvSourceCache.length === 0) {
     _cctvSourceCache = capped;
   } else {
@@ -4519,9 +5516,10 @@ function cctvProxy() {
   /** @type {Map<string,{id:string,status:string,sourceKind:string,label:string,message:string,updatedAt:number}>} */
   const health = new Map();
   /** Cap on health map entries to prevent unbounded growth. Sized to cover the
-   * full served catalog (CCTV_MAX_SOURCES hard-bounds at 1200) so health/status
-   * observability isn't silently evicted for a default 800-camera catalog. */
-  const HEALTH_MAX_ENTRIES = 1200;
+   * full served catalog (CCTV_MAX_SOURCES default 3000, hard-bounds at 6000)
+   * so health/status observability isn't silently evicted for the served
+   * world catalog. */
+  const HEALTH_MAX_ENTRIES = 4000;
 
   /** Update the health entry for a camera, evicting the oldest entry if at capacity. */
   const setHealth = (cameraId, patch) => {
@@ -5200,7 +6198,7 @@ export function openAiRealtimeProxy() {
         session: {
           type: 'realtime',
           model,
-          reasoning: { effort },
+          ...(String(model).includes('realtime-2') ? { reasoning: { effort } } : {}),
           truncation: {
             type: 'retention_ratio',
             retention_ratio: contextRetentionRatio,
@@ -7453,6 +8451,343 @@ function normalizeAisTimestamp(value) {
   return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
 }
 
+// ---------------------------------------------------------------------------
+// GEV command bus — Hermes MCP drives the OPEN browser tab
+// ---------------------------------------------------------------------------
+/**
+ * Pure parser for POST /api/gev/command bodies (unit-pinned vocabulary).
+ *
+ * @param {*} body Parsed JSON body.
+ * @returns {{ok:true, command:object}|{ok:false, error:string}}
+ */
+export function parseGevCommandRequest(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'Body must be a JSON object {action, ...}' };
+  }
+  const action = String(body.action ?? '').trim().toLowerCase();
+  if (action === 'fly') {
+    const query = String(body.query ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!query) return { ok: false, error: 'fly needs a non-empty {query}' };
+    return { ok: true, command: { action: 'fly', query } };
+  }
+  if (action === 'chip') {
+    const id = String(body.id ?? '').trim().toLowerCase();
+    if (!['ships', 'planes', 'events'].includes(id)) {
+      return { ok: false, error: 'chip id must be one of ships|planes|events' };
+    }
+    return { ok: true, command: { action: 'chip', id } };
+  }
+  if (action === 'cctv') {
+    const raw = body.on;
+    const on = raw === true || raw === 'true'
+      ? true
+      : raw === false || raw === 'false' ? false : null;
+    if (on === null) return { ok: false, error: 'cctv needs {on: true|false}' };
+    return { ok: true, command: { action: 'cctv', on } };
+  }
+  if (action === 'contacts') return { ok: true, command: { action: 'contacts' } };
+  return { ok: false, error: `Unknown action "${action || '(missing)'}" — use fly|chip|cctv|contacts` };
+}
+
+/**
+ * Turn a Nominatim /search jsonv2 hit into a fly plan for the tab. Range fits
+ * the hit's boundingbox diagonal (city → ~tens of km, country → orbit-scale),
+ * clamped sane on both ends; a hit without a usable bbox gets city framing.
+ * Returns null when the hit has no finite lat/lon — never a fake flight.
+ *
+ * @param {object} hit Nominatim result row.
+ * @returns {{lat:number, lon:number, label:string|null, rangeM:number, pitch:number}|null}
+ */
+export function nominatimFlyPlan(hit) {
+  const lat = Number(hit?.lat);
+  const lon = Number(hit?.lon);
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) {
+    return null;
+  }
+  const label = String(hit?.display_name ?? '').replace(/\s+/g, ' ').trim() || null;
+  let rangeM = 25_000;
+  const bb = Array.isArray(hit?.boundingbox) ? hit.boundingbox.map(Number) : [];
+  if (bb.length === 4 && bb.every(Number.isFinite)) {
+    const [south, north, west, east] = bb;
+    const diagM = Math.hypot(
+      (north - south) * 111_320,
+      (east - west) * 111_320 * Math.max(0.05, Math.cos((lat * Math.PI) / 180)),
+    );
+    if (diagM > 0) rangeM = diagM * 1.35;
+  }
+  return { lat, lon, label, rangeM: Math.min(9_000_000, Math.max(2_000, rangeM)), pitch: -50 };
+}
+
+/** Hostnames the command POST may arrive under (no ports, lowercased). */
+const GEV_BUS_LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/** Host header minus any :port (bracketed IPv6 kept whole). null when unusable. */
+function gevBusHostWithoutPort(hostHeader) {
+  const raw = String(hostHeader ?? '').trim().toLowerCase();
+  if (!raw || /[\s/?#@]/.test(raw)) return null;
+  const bracket = raw.match(/^\[([^\]]+)\](?::\d+)?$/);
+  if (bracket) return `[${bracket[1]}]`;
+  const plain = raw.match(/^([a-z0-9.-]+|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/);
+  return plain ? plain[1] : null;
+}
+
+/** Vite-allowedHosts-style match: exact, or leading-dot suffix (subdomains). */
+function gevBusHostAllowed(host, allowedHosts) {
+  if (allowedHosts === true) return true; // wide-share mode: any served host
+  const list = Array.isArray(allowedHosts) && allowedHosts.length ? allowedHosts : [...GEV_BUS_LOCAL_HOSTS, '.local'];
+  return list.some((entry) => host === entry
+    || (entry.startsWith('.') && (host.endsWith(entry) || host === entry.slice(1))));
+}
+
+/**
+ * Pure admission gate for the command-bus endpoints — the keySetup gate's
+ * lighter sibling: this surface drives the globe, it never writes
+ * credentials, so it shares the loopback/Host/Origin discipline without the
+ * sharing-mode kill switch. POST is loopback-socket only (Hermes MCP lives on
+ * this machine) with a local Host header (anti-rebinding) and, when a browser
+ * supplies Origin at all, an exact same-origin match (anti-CSRF — curl and
+ * node fetch omit the header and pass). SSE only needs a locally-served Host:
+ * the stream carries no secrets and cross-origin EventSource cannot read it
+ * without CORS headers this server never sends.
+ *
+ * @param {object} options
+ * @param {'post'|'sse'} options.channel
+ * @returns {{ok:true}|{ok:false, status:number, error:string}}
+ */
+export function admitGevCommandBusRequest({
+  channel,
+  method,
+  remoteAddress,
+  hostHeader,
+  origin,
+  contentType,
+  allowedHosts = null,
+}) {
+  if (channel === 'sse') {
+    if (method !== 'GET') return { ok: false, status: 405, error: 'Method not allowed' };
+    const host = gevBusHostWithoutPort(hostHeader);
+    if (!host || !gevBusHostAllowed(host, allowedHosts)) {
+      return { ok: false, status: 403, error: 'Commands stream answers only locally served hostnames' };
+    }
+    return { ok: true };
+  }
+  if (method !== 'POST') return { ok: false, status: 405, error: 'Method not allowed' };
+  const peer = String(remoteAddress ?? '').toLowerCase().replace(/^::ffff:/, '');
+  if (peer !== '127.0.0.1' && peer !== '::1') {
+    return { ok: false, status: 403, error: 'Command bus answers only the machine running the server' };
+  }
+  const host = gevBusHostWithoutPort(hostHeader);
+  if (!host || !GEV_BUS_LOCAL_HOSTS.has(host)) {
+    return { ok: false, status: 403, error: 'Command bus answers only local hostnames' };
+  }
+  const rawOrigin = String(origin ?? '').trim();
+  if (rawOrigin) {
+    let sameOrigin = false;
+    try {
+      const parsed = new URL(rawOrigin);
+      sameOrigin = parsed.host === String(hostHeader).trim().toLowerCase();
+    } catch { sameOrigin = false; }
+    if (!sameOrigin) return { ok: false, status: 403, error: 'Cross-origin requests are refused' };
+  }
+  if (!String(contentType ?? '').toLowerCase().includes('application/json')) {
+    return { ok: false, status: 415, error: 'Content-Type must be application/json' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Forward geocode through the shared Nominatim throttle queue (1.1 s spacing,
+ * house User-Agent — the same identity fetchRegionalPlace uses, so the app
+ * stays one client in Nominatim's rate budget).
+ *
+ * @param {string} query
+ * @returns {Promise<{ok:true, plan:object|null}|{ok:false, error:string}>}
+ *   plan null = honest no-match; ok:false = upstream/network failure.
+ */
+async function geocodeForCommand(query) {
+  const task = _nominatimQueue.then(async () => {
+    const waitMs = Math.max(0, 1100 - (Date.now() - _nominatimLastRequestAt));
+    if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    _nominatimLastRequestAt = Date.now();
+    const params = new URLSearchParams({
+      q: query,
+      format: 'jsonv2',
+      limit: '1',
+      addressdetails: '0',
+      'accept-language': 'en',
+    });
+    const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+      signal: AbortSignal.timeout(12_000),
+      headers: {
+        'User-Agent': 'GodsEyeView/0.1 (+https://github.com/bilawalsidhu/gods-eye-view)',
+        Referer: 'https://github.com/bilawalsidhu/gods-eye-view',
+      },
+    });
+    if (!response.ok) throw new Error(`Nominatim returned HTTP ${response.status}`);
+    const rows = await readResponseJsonCapped(response, 1024 * 1024);
+    const hit = Array.isArray(rows) ? rows[0] : null;
+    return { ok: true, plan: nominatimFlyPlan(hit) };
+  });
+  _nominatimQueue = task.catch(() => null);
+  try {
+    return await task;
+  } catch (err) {
+    return { ok: false, error: err?.message || 'Nominatim geocode failed' };
+  }
+}
+
+/**
+ * GEV command bus — the control plane for Hermes MCP.
+ *
+ * GET  /api/gev/commands — SSE. The open globe tab subscribes at boot; gets a
+ *   `hello` event, 25 s heartbeats, and every executed command as
+ *   `event: command` JSON.
+ * POST /api/gev/command — {action, ...} for fly|chip|cctv|contacts. Loopback
+ *   only. Executed commands fan out to every SSE subscriber so the LIVE
+ *   Cesium instance runs them (rail runners, controlCctv, context exit,
+ *   flyToLandmark after releaseAllTracking). With no tab connected the POST
+ *   answers honest {ok:false, error:'no_open_globe'} and does nothing — no
+ *   geocode spent, no fake success. `fly` geocodes via Nominatim OSM
+ *   server-side (User-Agent set, no Google, no OpenAI).
+ */
+function gevCommandBus({ allowedHosts = null } = {}) {
+  /** @type {Set<import('http').ServerResponse>} connected globe tabs. */
+  const subscribers = new Set();
+  let nextSeq = 0;
+
+  const respond = (res, statusCode, payload) => {
+    if (res.headersSent) return;
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(JSON.stringify(payload));
+  };
+
+  /** Fan one command out to every connected tab; returns the delivery count. */
+  const broadcast = (command) => {
+    nextSeq += 1;
+    const payload = JSON.stringify({ ...command, seq: nextSeq, at: new Date().toISOString() });
+    for (const res of subscribers) {
+      try {
+        res.write(`id: ${nextSeq}\nevent: command\ndata: ${payload}\n\n`);
+      } catch { /* close handler owns cleanup */ }
+    }
+    return subscribers.size;
+  };
+
+  const install = (server) => {
+    server.middlewares.use('/api/gev/commands', (req, res) => {
+      const sub = String(req.url ?? '').split('?')[0];
+      const admission = admitGevCommandBusRequest({
+        channel: 'sse',
+        method: req.method,
+        remoteAddress: req.socket?.remoteAddress,
+        hostHeader: req.headers?.host,
+        origin: req.headers?.origin,
+        contentType: req.headers?.['content-type'],
+        allowedHosts,
+      });
+      if (sub !== '' && sub !== '/') return respond(res, 404, { error: 'not_found' });
+      if (!admission.ok) return respond(res, admission.status, { error: admission.error });
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-store, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.write('retry: 3000\n\n');
+      res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, subscribers: subscribers.length + 1 })}\n\n`);
+      subscribers.add(res);
+      const heartbeat = setInterval(() => {
+        try {
+          res.write(': hb\n\n');
+        } catch { /* cleanup below owns the socket */ }
+      }, 25_000);
+      const cleanup = () => {
+        clearInterval(heartbeat);
+        subscribers.delete(res);
+      };
+      req.on('close', cleanup);
+      res.on('close', cleanup);
+    });
+
+    server.middlewares.use('/api/gev/command', async (req, res) => {
+      const sub = String(req.url ?? '').split('?')[0];
+      const admission = admitGevCommandBusRequest({
+        channel: 'post',
+        method: req.method,
+        remoteAddress: req.socket?.remoteAddress,
+        hostHeader: req.headers?.host,
+        origin: req.headers?.origin,
+        contentType: req.headers?.['content-type'],
+        allowedHosts,
+      });
+      if (sub !== '' && sub !== '/') return respond(res, 404, { error: 'not_found' });
+      if (!admission.ok) return respond(res, admission.status, { error: admission.error });
+
+      let body;
+      try {
+        body = await readRequestBodyCapped(req, 8192);
+      } catch (err) {
+        return respond(res, err?.code === 'BODY_TOO_LARGE' ? 413 : 400, {
+          error: err?.code === 'BODY_TOO_LARGE' ? 'Request too large' : 'Could not read request body',
+        });
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(body.toString('utf8') || '{}');
+      } catch {
+        return respond(res, 400, { error: 'Invalid JSON' });
+      }
+      const verdict = parseGevCommandRequest(parsed);
+      if (!verdict.ok) return respond(res, 400, { error: verdict.error });
+      const command = verdict.command;
+
+      // No tab connected → honest refusal, and nothing spent upstream.
+      if (!subscribers.size) {
+        return respond(res, 200, { ok: false, error: 'no_open_globe', connected: 0, action: command.action });
+      }
+
+      if (command.action === 'fly') {
+        const geocode = await geocodeForCommand(command.query);
+        if (!geocode.ok) return respond(res, 502, { ok: false, error: 'geocode_failed', detail: geocode.error });
+        if (!geocode.plan) {
+          return respond(res, 200, { ok: false, error: 'no_match', action: 'fly', query: command.query });
+        }
+        const delivered = broadcast({
+          action: 'fly',
+          query: command.query,
+          lat: geocode.plan.lat,
+          lon: geocode.plan.lon,
+          label: geocode.plan.label,
+          rangeM: geocode.plan.rangeM,
+          pitch: geocode.plan.pitch,
+        });
+        return respond(res, 200, {
+          ok: true,
+          action: 'fly',
+          delivered,
+          query: command.query,
+          label: geocode.plan.label,
+          lat: geocode.plan.lat,
+          lon: geocode.plan.lon,
+          rangeM: geocode.plan.rangeM,
+        });
+      }
+
+      const delivered = broadcast(command);
+      return respond(res, 200, { ok: true, action: command.action, delivered, ...command });
+    });
+  };
+
+  return {
+    name: 'gev-command-bus',
+    configureServer: install,
+    configurePreviewServer: install,
+  };
+}
+
 /**
  * In-app key setup ("POWER UP" panel) — dev-server only.
  *
@@ -7726,7 +9061,13 @@ export default defineConfig(({ mode }) => {
     if (process.env[key] === undefined) process.env[key] = val;
   }
   const env = { ...process.env };
-  const localAllowedHosts = ['localhost', '127.0.0.1', '.local'];
+  const localAllowedHosts = [
+    'localhost',
+    '127.0.0.1',
+    '.local',
+    'athenas-mac-mini.tail1b56bd.ts.net',
+    '.tail1b56bd.ts.net',
+  ];
   return {
     plugins: [
       cesium(),
@@ -7734,6 +9075,8 @@ export default defineConfig(({ mode }) => {
       celestrakProxy(),
       tomtomProxy(),
       firmsProxy(),
+      conflictsProxy(),
+      newsProxy(),
       rocketLaunchesProxy(),
       terrainHeightsProxy(),
       adsbdbProxy(),
@@ -7750,6 +9093,13 @@ export default defineConfig(({ mode }) => {
       openAiRealtimeProxy(),
       googlePlacesContextProxy(),
       keySetupEndpoint(),
+      gevCommandBus({
+        // Mirror the dev server's own host policy: Tailscale names and .local
+        // may SERVE the tab (SSE), while the POST stays loopback-socket only.
+        allowedHosts: (env.HOST === '0.0.0.0' || env.HOST === '::')
+          ? true
+          : localAllowedHosts,
+      }),
     ],
     server: {
       host: env.HOST || 'localhost',

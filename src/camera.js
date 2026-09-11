@@ -74,3 +74,18 @@ export function flyToAustin(viewer) {
     });
   }, 500);
 }
+
+/**
+ * Open on the whole Earth (command-globe boot view), not a city.
+ * A slow rotation-less high-orbit framing of the Americas/Atlantic lanes.
+ */
+export function flyToWorldView(viewer) {
+  viewer.camera.setView({
+    destination: Cesium.Cartesian3.fromDegrees(-40, 25, 22000000),
+    orientation: {
+      heading: Cesium.Math.toRadians(0),
+      pitch: Cesium.Math.toRadians(-90),
+      roll: 0.0,
+    },
+  });
+}

@@ -17,7 +17,10 @@
 /** Chip label — pure, exported for tests. */
 export function keySetupChipLabel(status) {
   const missing = Math.max(0, (status?.total || 0) - (status?.setCount || 0));
-  return missing > 0 ? `POWER UP · ${missing} ${missing === 1 ? 'KEY' : 'KEYS'} WAITING` : 'POWERED UP';
+  if (missing <= 0) return 'POWERED UP';
+  const setCount = status?.setCount || 0;
+  if (setCount === 0) return `POWER UP · ${missing} ${missing === 1 ? 'KEY' : 'KEYS'} WAITING`;
+  return `POWER UP · ${setCount} ON · ${missing} WAITING`;
 }
 
 /**
@@ -73,11 +76,15 @@ function buildRow(documentRef, key) {
   led.setAttribute('aria-hidden', 'true');
   const title = documentRef.createElement('strong');
   title.textContent = key.title;
+  const have = documentRef.createElement('span');
+  have.className = key.set ? 'key-setup-have' : 'key-setup-needed';
+  have.textContent = key.set ? 'HAVE KEY' : 'NEEDED';
+  have.title = key.set ? 'A key is saved in .env' : 'No key saved yet';
   const tier = documentRef.createElement('span');
   tier.className = 'key-setup-tier';
   tier.textContent = TIER_DOTS[key.tier] || '';
   tier.title = key.tier === 'metered' ? 'Metered — a billing-enabled account' : 'Free key — register, paste, done';
-  head.append(led, title, tier);
+  head.append(led, title, have, tier);
   if (key.clientExposed) {
     const exposed = documentRef.createElement('span');
     exposed.className = 'key-setup-exposed';

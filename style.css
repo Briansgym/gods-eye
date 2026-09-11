@@ -6359,6 +6359,168 @@ body.cockpit-mode #intel-hud .hud-right-edge { right: 22px; }
 #left-panel-stack > #scene-panel { order: 4; }
 
 /*
+ * NEWS roster (order 3): readable headlines for the News layer. Static panel
+ * in the accordion, shown only while the layer is ON (src/newsRoster.js).
+ * Same stack contract as DATA LAYERS/CCTV so the adaptive engine owns its
+ * height and corridor collisions.
+ */
+#left-panel-stack > #news-roster-panel {
+  position: relative;
+  top: auto;
+  right: auto;
+  bottom: auto;
+  left: auto;
+  z-index: auto;
+  max-height: none;
+  flex: 0 0 auto;
+  min-height: 0;
+  pointer-events: auto;
+  order: 3;
+}
+
+#left-panel-stack > #news-roster-panel:not(.collapsed) {
+  box-sizing: border-box;
+  flex: 0 1 var(--left-panel-allocated-height, auto);
+  height: var(--left-panel-allocated-height, auto);
+  max-height: var(--left-panel-allocated-height, 100%);
+}
+
+.news-roster-inner {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  width: var(--panel-expanded-width, 280px);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--panel-radius);
+  padding: 14px 16px 12px;
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(255, 255, 255, 0.03) inset,
+    0 1px 0 rgba(255, 255, 255, 0.06) inset;
+}
+
+#left-panel-stack > #news-roster-panel:not(.collapsed) .news-roster-inner {
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
+}
+
+#news-roster-panel[hidden] { display: none; }
+
+.news-roster-status {
+  margin: 2px 0 8px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+.news-roster-status[data-tone='error'] { color: #ff8a80; }
+.news-roster-status[data-tone='loading'] { color: #ffd57e; }
+
+.news-roster-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 212, 255, 0.45) transparent;
+}
+
+.news-roster-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 7px 9px;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.news-roster-item:hover {
+  border-color: var(--glass-border-hover);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.news-roster-item.selected {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  box-shadow: 0 0 12px rgba(0, 212, 255, 0.15);
+}
+
+.news-roster-item-title {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-primary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.news-roster-item-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+
+.news-roster-item-domain {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.news-roster-item-age { flex: none; }
+
+.news-roster-footer {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+#news-roster-panel.collapsed .news-roster-list,
+#news-roster-panel.collapsed .news-roster-status,
+#news-roster-panel.collapsed .news-roster-footer {
+  display: none !important;
+}
+
+#news-roster-panel.collapsed {
+  width: var(--left-collapsed-width);
+}
+
+#news-roster-panel.collapsed .news-roster-inner { padding-bottom: 10px; }
+
+#news-roster-panel.collapsed .panel-header { margin-bottom: 2px; }
+
+#news-roster-panel.collapsed .panel-title {
+  font-size: 8px;
+  letter-spacing: 1.8px;
+}
+
+/*
  * Runtime focus mode: the layout engine applies this only when the expanded
  * panel's measured natural height plus sibling labels cannot fit inside the
  * live HUD/attribution-safe corridor.
@@ -9373,6 +9535,29 @@ body.scene-playback-mode #first-run-launcher {
   box-shadow: 0 0 0.5rem rgba(84, 227, 156, 0.66);
 }
 
+.key-setup-have,
+.key-setup-needed {
+  font-size: 0.5rem;
+  font-weight: 600;
+  letter-spacing: 0.08rem;
+  text-transform: uppercase;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.5rem;
+  flex: none;
+}
+
+.key-setup-have {
+  color: #54e39c;
+  border: 1px solid rgba(84, 227, 156, 0.45);
+  background: rgba(84, 227, 156, 0.12);
+}
+
+.key-setup-needed {
+  color: rgba(148, 178, 188, 0.8);
+  border: 1px solid rgba(148, 178, 188, 0.3);
+  background: rgba(148, 178, 188, 0.08);
+}
+
 .key-setup-tier { font-size: 0.55rem; }
 
 .key-setup-exposed {
@@ -9517,3 +9702,131 @@ body.scene-playback-mode #key-setup {
   border-color: rgba(255, 170, 150, 0.65);
   outline: none;
 }
+
+/* ===================== Command rail (command globe) ===================== */
+
+#command-rail {
+  position: fixed;
+  left: auto;
+  right: 16px;
+  top: auto;
+  bottom: 16px;
+  transform: none;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  z-index: 1200;
+  pointer-events: none;
+}
+
+#command-rail .command-chip {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: rgba(6, 12, 18, 0.78);
+  border: 1px solid rgba(0, 220, 255, 0.35);
+  border-radius: 10px;
+  color: rgba(220, 240, 255, 0.92);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.72rem;
+  letter-spacing: 0.14rem;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: border-color var(--transition-fast, 0.15s), background var(--transition-fast, 0.15s), transform var(--transition-fast, 0.15s);
+}
+
+#command-rail .command-chip:hover,
+#command-rail .command-chip:focus-visible {
+  border-color: rgba(0, 220, 255, 0.85);
+  background: rgba(10, 22, 32, 0.9);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+#command-rail .command-chip:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+#command-rail .command-chip .material-symbols-outlined {
+  font-size: 16px;
+  color: #00dcff;
+}
+
+#command-rail .command-chip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(120, 140, 150, 0.5);
+  flex: none;
+}
+
+#command-rail .command-chip-dot[data-state="live"] { background: #2ee66b; box-shadow: 0 0 6px rgba(46, 230, 107, 0.8); }
+#command-rail .command-chip-dot[data-state="connecting"] { background: #ffc857; box-shadow: 0 0 6px rgba(255, 200, 87, 0.7); }
+#command-rail .command-chip-dot[data-state="missing-key"] { background: #ff7a59; box-shadow: 0 0 6px rgba(255, 122, 89, 0.7); }
+#command-rail .command-chip-dot[data-state="unavailable"] { background: #ff5c5c; box-shadow: 0 0 6px rgba(255, 90, 90, 0.7); }
+#command-rail .command-chip-dot[data-state="disabled"] { background: rgba(120, 140, 150, 0.25); }
+
+#command-rail-status {
+  pointer-events: none;
+  max-width: 70vw;
+  padding: 6px 12px;
+  background: rgba(6, 12, 18, 0.85);
+  border: 1px solid rgba(0, 220, 255, 0.3);
+  border-radius: 8px;
+  color: rgba(220, 240, 255, 0.95);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.66rem;
+  letter-spacing: 0.06rem;
+  text-align: center;
+}
+
+#command-rail-status[data-tone="ok"] { border-color: rgba(46, 230, 107, 0.55); }
+#command-rail-status[data-tone="empty"] { border-color: rgba(255, 122, 89, 0.55); }
+#command-rail-status[data-tone="warn"] { border-color: rgba(255, 200, 87, 0.55); }
+
+/* Typed command box — one line + Enter, above the chips (brief 2026-09-09). */
+#command-box-form {
+  pointer-events: auto;
+  display: flex;
+  margin-bottom: 2px;
+}
+
+#command-box {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  background: rgba(6, 12, 18, 0.78);
+  border: 1px solid rgba(0, 220, 255, 0.35);
+  border-radius: 10px;
+  color: rgba(220, 240, 255, 0.92);
+  font-family: var(--font-mono, monospace);
+  font-size: 0.72rem;
+  letter-spacing: 0.06rem;
+  backdrop-filter: blur(6px);
+  transition: border-color var(--transition-fast, 0.15s), background var(--transition-fast, 0.15s);
+}
+
+#command-box::placeholder {
+  color: rgba(120, 140, 150, 0.55);
+  letter-spacing: 0.03rem;
+}
+
+#command-box:hover {
+  border-color: rgba(0, 220, 255, 0.55);
+}
+
+#command-box:focus {
+  outline: none;
+  border-color: rgba(0, 220, 255, 0.85);
+  background: rgba(10, 22, 32, 0.9);
+}
+
+#command-box[data-busy] {
+  border-color: rgba(255, 200, 87, 0.6);
+}
+

@@ -304,7 +304,7 @@ export function createGevActionRunner({ viewer, styleManager, dataManager, scene
     // otherwise the tracker drags the view back and "I flew there but can't
     // do anything" (field finding). track_entity manages its own handoff.
     if (name === 'zoom_to_globe' && viewer.trackedEntity) {
-      stopAllTracking(viewer, dataManager);
+      releaseAllTracking(viewer, dataManager);
     }
 
     // Zoom during an active orbit adjusts the orbit RADIUS (spiral in/out) —
@@ -784,7 +784,7 @@ export function createGevActionRunner({ viewer, styleManager, dataManager, scene
             return;
           }
           interruptCameraMotion('nav:fly_to_location');
-          if (viewer.trackedEntity) stopAllTracking(viewer, dataManager);
+          if (viewer.trackedEntity) releaseAllTracking(viewer, dataManager);
         },
       });
     }
@@ -907,7 +907,7 @@ export function createGevActionRunner({ viewer, styleManager, dataManager, scene
     }
 
     if (name === 'stop_tracking') {
-      return stopAllTracking(viewer, dataManager);
+      return releaseAllTracking(viewer, dataManager);
     }
 
     if (name === 'frame_overhead') {
@@ -1739,7 +1739,7 @@ async function trackEntity(viewer, dataManager, styleManager, args = {}) {
 }
 
 /** Releases tracking/selection on every entity layer family. */
-function stopAllTracking(viewer, dataManager) {
+export function releaseAllTracking(viewer, dataManager) {
   const released = [];
   const failed = new Set();
   for (const family of TRACKABLE_FAMILIES) {

@@ -33,6 +33,18 @@ const DEFAULT_TRACKED_OVERLAY_HOST = Object.freeze({
   clearSource: clearOverlaySource,
 });
 
+/**
+ * Layers whose selection rides the separate awareness-subject lane
+ * (`gev:awareness-subject-selected`), consumed by the readout card and
+ * Contacts panel. A shared-card selection from these would double-publish.
+ */
+const TRACKED_SUBJECT_LAYER_IDS = Object.freeze(new Set([
+  'flights',
+  'military',
+  'satellites',
+  'ais-live-vessels',
+]));
+
 let _viewer = null;
 let _trackedEntityChangedRemove = null;
 let _selectedContext = null;
@@ -210,9 +222,24 @@ export function initTrackedReadout(viewer) {
   }) || null;
   _contextSelectedHandler = (event) => {
     const record = event.detail;
-    if (record?.layerId === 'military-installations') {
+    // Tracking layers (aircraft, vessels, satellites) publish selection on the
+    // separate `gev:awareness-subject-selected` lane, which the readout card
+    // and Contacts panel already consume — a shared card here would make the
+    // two surfaces fight over one subject.
+    if (record && TRACKED_SUBJECT_LAYER_IDS.has(record.layerId)) {
+      if (_selectedContext) {
+        _selectedContext = null;
+        syncActiveEntity();
+      }
+      return;
+    }
+    // Any other layer that carries a tracked presentation model paints the
+    // shared selection card (installations, conflicts, news, …). Layers whose
+    // entities have no model never paint — and replace any card already up.
+    const entity = record?.entity;
+    if (entity && createTrackedOverlayEntry(entity)) {
       _selectedContext = record;
-      publishEntity(record.entity);
+      publishEntity(entity);
       return;
     }
     if (_selectedContext) {

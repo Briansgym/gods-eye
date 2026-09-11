@@ -1,3 +1,5 @@
+> **Fork.** This is Brian Spencer / ISS’s working copy of [bilawalsidhu/gods-eye-view](https://github.com/bilawalsidhu/gods-eye-view) (MIT) — not the upstream project. Extra layers and how to run: **[FORK.md](FORK.md)**. `.env` is gitignored; copy `.env.example` if you need keys.
+
 <div align="center">
 
 # 🌐 God's Eye View
