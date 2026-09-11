@@ -25,6 +25,22 @@ No keys required for a keyless globe (Esri + OSM). Copy `.env.example` → `.env
 - **Conflicts** — UCDP-backed conflict layer
 - **News** — GDELT-backed news layer + roster panel
 - **World camera catalogs** — `config/cctv_catalogs.json` (see `docs/CAMERA-CATALOGS.md`)
+- **Session spend HUD** — always-on `VOICE` + `MAPS` estimates (not invoices). Maps is instrumented only — never blocked. Voice still has the existing session kill.
+- **Voice inspect-dive** — “zoom in on a conflict / the news / an earthquake” tracks overlay contacts and briefs from the tool result. Voice stays American English unless you ask otherwise.
+
+## Sharing this checkout (Hunter / other clones)
+
+GitHub is the bus. Clone, use **your own** keys in POWER UP / local `.env`, work on a branch, open a PR. Do not commit `.env`. Do not plug two Hermes instances into each other.
+
+```bash
+git clone https://github.com/Briansgym/gods-eye.git
+cd gods-eye
+npm install
+npm run test
+npm run dev
+```
+
+Need write access? Ask Brian to add your GitHub username as a collaborator. Until then, fork + PR works on this public repo.
 
 ## Honest limits
 

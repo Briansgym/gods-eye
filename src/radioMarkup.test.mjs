@@ -174,16 +174,48 @@ test('no unchanged Realtime tool definition drifts silently', () => {
     'fly_to_location',
     'select_nearest_aircraft',
     'set_map_stack',
+    // 2026-09-11 voice inspect-dive brief: track_entity gained the overlay
+    // families (conflicts / news / earthquakes) in its description and
+    // layerId hint.
+    'track_entity',
   ]);
   const unchanged = realtimeTools()
     .filter((tool) => !TOUCHED.has(tool.name))
     .sort((a, b) => a.name.localeCompare(b.name));
-  assert.equal(unchanged.length, 21);
+  assert.equal(unchanged.length, 20);
   const digest = createHash('sha256')
     .update(JSON.stringify(unchanged))
     .digest('hex')
     .slice(0, 16);
-  assert.equal(digest, '802ed694b8887b88', 'an unchanged Realtime tool definition drifted');
+  assert.equal(digest, 'c59bd36b894b7e38', 'an unchanged Realtime tool definition drifted');
+});
+
+test('the overlay inspect-dive instruction and track_entity dive contract are pinned', () => {
+  // 2026-09-11 brief: voice must zoom/inspect ANY geolocated contact —
+  // conflict points, news pins, quakes — never claim it cannot. The rule
+  // lives only in the session instructions and the tool description, so both
+  // are pinned; a silent trim here silently re-teaches the model to refuse.
+  const start = voice.indexOf("'ZOOM/INSPECT/TELL-ME-ABOUT a visible contact");
+  assert.ok(start >= 0, 'the overlay inspect-dive instruction is missing');
+  const text = voice.slice(start, voice.indexOf('\n', start));
+  assert.match(text, /named or generic/);
+  assert.match(text, /zoom in on a conflict/);
+  assert.match(text, /zoom in on the news/);
+  assert.match(text, /means track_entity/);
+  assert.match(text, /Do not say you cannot zoom to it/);
+  assert.match(text, /still call track_entity — it enables the layer itself/);
+  assert.match(text, /Named cities and places still use fly_to_location/);
+  assert.match(text, /short briefing from the tool result fields/);
+
+  const byName = new Map(realtimeTools().map((tool) => [tool.name, tool]));
+  const track = byName.get('track_entity');
+  assert.match(track.description, /inspect-dive/);
+  assert.match(track.description, /conflict points, news pins, earthquakes/);
+  assert.match(track.description, /enables the layer if it is off/);
+  assert.match(
+    track.parameters.properties.layerId.description,
+    /conflicts \| news \| earthquakes/,
+  );
 });
 
 test('Radio volume and mission speed share the Sharpen slider visual language', () => {

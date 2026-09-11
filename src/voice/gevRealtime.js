@@ -1795,6 +1795,14 @@ export class GevRealtimeController {
         `Warns at ${formatCostUsd(state.warnUsd)}, ends the session at ${formatCostUsd(state.capUsd)}.`
         + (state.note ? ` ${state.note}` : '');
     }
+    // Mirror the SAME tracker state to the always-on bottom-left spend HUD
+    // (src/spendHud.js). One estimate, two surfaces — the HUD never computes
+    // its own number, so the mic chip and the HUD can never disagree.
+    try {
+      window.dispatchEvent(new CustomEvent('gev:voice-cost-update', { detail: state }));
+    } catch {
+      // A HUD listener failure must never break the voice UI.
+    }
   }
 
   /**

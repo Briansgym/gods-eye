@@ -9830,3 +9830,72 @@ body.scene-playback-mode #key-setup {
   border-color: rgba(255, 200, 87, 0.6);
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Session spend HUD (#gev-spend-hud) — always-on bottom-left VOICE/MAPS
+ * estimate cluster (src/spendHud.js). Independent of the military-only
+ * #intel-hud. Sits ABOVE #cesium-credits: the Google attribution line is
+ * a ToS requirement and must never be covered (credits sit at 0.75rem in
+ * normal chrome, 36px in clean-view/recording — both offsets mirrored
+ * here), and NEAR the intel HUD's MGRS block without overlapping it.
+ * ------------------------------------------------------------------ */
+#gev-spend-hud {
+  position: fixed;
+  left: 1.5rem;
+  bottom: 5.25rem;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  line-height: 1.3;
+  color: var(--text-dim, rgba(232, 234, 237, 0.55));
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  user-select: none;
+}
+
+#gev-spend-hud .gev-spend-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5em;
+}
+
+#gev-spend-hud .gev-spend-label {
+  min-width: 3.2em; /* VOICE/MAPS share one column so the $ figures align */
+  opacity: 0.75;
+}
+
+#gev-spend-hud .gev-spend-value {
+  font-variant-numeric: tabular-nums;
+  transition: color var(--transition-fast, 0.15s);
+}
+
+/* Same level palette as .gev-voice-cost-value on the mic chip: amber warn,
+   red cap. Only VOICE can reach 'cap' (the $5 session kill in voiceCost);
+   Maps has no hard kill by design and stops at 'warn'. */
+#gev-spend-hud .gev-spend-value[data-level='warn'] {
+  color: #ffc46b;
+}
+
+#gev-spend-hud .gev-spend-value[data-level='cap'] {
+  color: #ff6b6b;
+  font-weight: 600;
+}
+
+/* Clean-view / recording: #cesium-credits moves to 36px/36px — track it so
+   the spend readout stays just above the attribution, never on it. */
+body.ui-clean-view #gev-spend-hud,
+body.recording-mode #gev-spend-hud {
+  left: 36px;
+  bottom: calc(36px + 2.6rem);
+}
+
+@media (max-width: 900px) {
+  #gev-spend-hud {
+    left: 0.75rem;
+    bottom: calc(2vh + 7.6rem); /* credits sit at calc(2vh + 5rem) here */
+  }
+}

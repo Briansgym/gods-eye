@@ -543,6 +543,214 @@ test('tracked aircraft yields to strongest-fire and vessel voice flights before 
   }
 });
 
+/** Conflicts module stub for the overlay inspect-dive tests. */
+function createConflictsModuleStub(order, records) {
+  return {
+    getAnalystRecords: () => records,
+    selectEvent: (entityId) => { order.push(`select:${entityId}`); return true; },
+  };
+}
+
+const CONFLICT_RECORDS = [
+  { id: '11', conflict: 'Mali: JNIM - Government', country: 'Mali', lat: 16.27, lon: -0.05, dateStart: '2026-08-01', deathsBest: 12, type: 1 },
+  { id: '22', conflict: 'Sudan: RSF - SAF', country: 'Sudan', lat: 15.5, lon: 32.55, dateStart: '2026-09-01', deathsBest: 240, type: 1 },
+  { id: '33', conflict: 'Unlocated skirmish', country: 'Nowhere', lat: null, lon: null, dateStart: '2026-09-05', deathsBest: 900, type: 2 },
+];
+
+test('generic "a conflict" voice query dives the deadliest geolocated record with a briefing', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  for (const query of ['a conflict', 'conflict point', 'zoom in on a conflict']) {
+    const { order, viewer, styleManager } = createVoiceNavigationHarness();
+    const dataManager = {
+      layers: new Map([['conflicts', { module: createConflictsModuleStub(order, CONFLICT_RECORDS) }]]),
+      isEnabled: (id) => id === 'conflicts',
+      getAll: () => [],
+    };
+    const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+    const result = await runner('track_entity', { query });
+    assert.equal(result.ok, true, query);
+    assert.equal(result.kind, 'conflict');
+    assert.equal(result.layerId, 'conflicts');
+    // The deadliest GEOLOCATED record wins — never the ungeolocated 900.
+    assert.equal(result.label, 'Sudan: RSF - SAF');
+    assert.equal(result.deathsBest, 240);
+    assert.equal(result.latitude, 15.5);
+    assert.match(result.briefing, /Sudan: RSF - SAF/);
+    assert.match(result.briefing, /240 fatalities/);
+    assert.match(result.briefing, /UCDP GED/);
+    assert.deepEqual(order, ['stamp:conflict', 'release', 'cancel', 'select:conflict:22', 'fly:released'], query);
+  }
+});
+
+test('a named conflict voice query matches the right record, not the deadliest', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  const { order, viewer, styleManager } = createVoiceNavigationHarness();
+  const dataManager = {
+    layers: new Map([['conflicts', { module: createConflictsModuleStub(order, CONFLICT_RECORDS) }]]),
+    isEnabled: (id) => id === 'conflicts',
+    getAll: () => [],
+  };
+  const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+  const result = await runner('track_entity', { query: 'the Mali conflict' });
+  assert.equal(result.ok, true);
+  assert.equal(result.label, 'Mali: JNIM - Government');
+  assert.equal(result.country, 'Mali');
+  assert.equal(result.deathsBest, 12);
+  assert.equal(order.at(-2), 'select:conflict:11');
+  assert.equal(order.at(-1), 'fly:released');
+});
+
+const NEWS_RECORDS = [
+  { id: 'a1', title: 'Dam collapse floods valley towns', domain: 'example.org', url: 'https://example.org/dam', lat: 46.2, lon: 7.5, seenMs: Date.now() - 3_600_000 },
+  { id: 'b2', title: 'Ceasefire talks resume', domain: 'wire.example', url: 'https://wire.example/talks', lat: 31.5, lon: 34.45, seenMs: Date.now() - 300_000 },
+];
+
+/** News module stub for the overlay inspect-dive tests. */
+function createNewsModuleStub(order, records = NEWS_RECORDS) {
+  return {
+    getAnalystRecords: () => records,
+    getFocusRecord: () => (records.length
+      ? { ...records[1] || records[0], entityId: `news:${(records[1] || records[0]).id}`, ageText: '5m ago' }
+      : null),
+    selectEvent: (entityId) => { order.push(`select:${entityId}`); return true; },
+  };
+}
+
+test('generic "the news" voice query flies to the focus record like the NEWS chip', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  for (const query of ['the news', 'a news story']) {
+    const { order, viewer, styleManager } = createVoiceNavigationHarness();
+    const dataManager = {
+      layers: new Map([['news', { module: createNewsModuleStub(order) }]]),
+      isEnabled: (id) => id === 'news',
+      getAll: () => [],
+    };
+    const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+    const result = await runner('track_entity', { query });
+    assert.equal(result.ok, true, query);
+    assert.equal(result.kind, 'news');
+    assert.equal(result.title, 'Ceasefire talks resume');
+    assert.equal(result.domain, 'wire.example');
+    assert.equal(result.url, 'https://wire.example/talks');
+    assert.match(result.briefing, /Ceasefire talks resume/);
+    assert.match(result.briefing, /GDELT/);
+    assert.deepEqual(order, ['stamp:news', 'release', 'cancel', 'select:news:b2', 'fly:released'], query);
+  }
+});
+
+test('a specific news title voice query matches its own record', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  const { order, viewer, styleManager } = createVoiceNavigationHarness();
+  const dataManager = {
+    layers: new Map([['news', { module: createNewsModuleStub(order) }]]),
+    isEnabled: (id) => id === 'news',
+    getAll: () => [],
+  };
+  const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+  const result = await runner('track_entity', { query: 'the story about the dam collapse' });
+  assert.equal(result.ok, true);
+  assert.equal(result.title, 'Dam collapse floods valley towns');
+  assert.equal(result.latitude, 46.2);
+  assert.equal(order.at(-2), 'select:news:a1');
+  assert.equal(order.at(-1), 'fly:released');
+});
+
+test('an empty overlay feed reports an honest empty and never flies', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  const cases = [
+    ['conflicts', 'a conflict', { module: { getAnalystRecords: () => [] } }],
+    ['news', 'the news', { module: { getAnalystRecords: () => [], getFocusRecord: () => null } }],
+    ['earthquakes', 'an earthquake', { module: { getAnalystRecords: () => [] } }],
+  ];
+  for (const [layerId, query, entry] of cases) {
+    const { order, viewer, styleManager } = createVoiceNavigationHarness();
+    const dataManager = {
+      layers: new Map([[layerId, entry]]),
+      isEnabled: (id) => id === layerId,
+      getAll: () => [],
+    };
+    const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+    const result = await runner('track_entity', { query });
+    assert.equal(result.ok, false, layerId);
+    assert.equal(result.layerId, layerId);
+    assert.ok(result.error, `${layerId} carries a plain error`);
+    assert.doesNotMatch(result.error, /cannot zoom/i);
+    assert.deepEqual(order, [], `${layerId} must not stamp or fly on empty`);
+  }
+});
+
+test('a disabled overlay layer is enabled (origin voice), refreshed, then dived', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  const { order, viewer, styleManager } = createVoiceNavigationHarness();
+  let enabled = false;
+  const enableCalls = [];
+  const refreshed = [];
+  const dataManager = {
+    layers: new Map([['conflicts', { module: createConflictsModuleStub(order, CONFLICT_RECORDS) }]]),
+    isEnabled: (id) => id === 'conflicts' && enabled,
+    async setEnabled(layerId, on, options) {
+      enableCalls.push([layerId, on, options]);
+      enabled = true;
+    },
+    async refreshLayer(layerId) { refreshed.push(layerId); },
+    getAll: () => [],
+  };
+  const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+  const result = await runner('track_entity', { query: 'a conflict' });
+  assert.deepEqual(enableCalls, [['conflicts', true, { origin: 'voice' }]]);
+  assert.deepEqual(refreshed, ['conflicts']);
+  assert.equal(result.ok, true);
+  assert.equal(result.kind, 'conflict');
+  assert.equal(order.at(-1), 'fly:released');
+});
+
+test('generic quake voice query dives the newest M4.5+ record with quake framing', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  const { order, viewer, styleManager } = createVoiceNavigationHarness();
+  const quakes = {
+    getAnalystRecords: () => [
+      { id: 'q-old', magnitude: 6.1, place: 'off the coast of Chile', lat: -30.1, lon: -71.5, timeMs: Date.now() - 7_200_000 },
+      { id: 'q-new', magnitude: 5.2, place: 'central Japan', lat: 36.2, lon: 138.2, timeMs: Date.now() - 600_000 },
+      { id: 'q-small', magnitude: 2.1, place: 'southern Nevada', lat: 36.0, lon: -115.2, timeMs: Date.now() - 60_000 },
+    ],
+    selectEvent: (entityId) => { order.push(`select:${entityId}`); return true; },
+  };
+  const dataManager = {
+    layers: new Map([['earthquakes', { module: quakes }]]),
+    isEnabled: (id) => id === 'earthquakes',
+    getAll: () => [],
+  };
+  const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+  const result = await runner('track_entity', { query: 'an earthquake' });
+  assert.equal(result.ok, true);
+  assert.equal(result.kind, 'earthquake');
+  assert.equal(result.place, 'central Japan', 'newest M4.5+ wins, not the small fresh one');
+  assert.equal(result.magnitude, 5.2);
+  assert.match(result.briefing, /M5\.2/);
+  assert.match(result.briefing, /USGS/);
+  assert.deepEqual(order, ['stamp:earthquake', 'release', 'cancel', 'select:earthquake:q-new', 'fly:released']);
+});
+
+test('Cockpit refuses overlay inspect-dives before any selection or camera mutation', async () => {
+  globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
+  for (const [layerId, query, module] of [
+    ['conflicts', 'a conflict', createConflictsModuleStub([], CONFLICT_RECORDS)],
+    ['news', 'the news', createNewsModuleStub([])],
+  ]) {
+    const { order, viewer, styleManager } = createVoiceNavigationHarness({ cockpitActive: true });
+    const dataManager = {
+      layers: new Map([[layerId, { module }]]),
+      isEnabled: (id) => id === layerId,
+      getAll: () => [],
+    };
+    const runner = createGevActionRunner({ viewer, styleManager, dataManager });
+    const result = await runner('track_entity', { query });
+    assert.equal(result.ok, false, layerId);
+    assert.deepEqual(order, [], layerId);
+    assert.equal(viewer.trackedEntity?.id, 'prior-aircraft');
+  }
+});
+
 test('move_camera and fly_route validate first, then use the shared camera authority seam', async () => {
   globalThis.window = globalThis.window || { clearTimeout, setTimeout, requestIdleCallback: null };
   const { order, viewer, styleManager } = createVoiceNavigationHarness();

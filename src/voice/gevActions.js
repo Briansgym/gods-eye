@@ -20,6 +20,9 @@ import { isPickedWorldPosition } from '../data/scenePick.js';
 import { resolveRegionRingForQuery } from '../annotations/annotationResolver.js';
 import { normalizeRadioCountryInput } from '../data/radioCountry.js';
 import { TR3B_CLASS } from '../data/tr3bRegistry.js';
+import { conflictDiveBanner, conflictEntityId, conflictRangeM } from '../data/conflictsModel.js';
+import { newsAgeText, newsEntityId } from '../data/newsModel.js';
+import { WORLD_FOCUS_FRAMING } from '../worldFocus.js';
 
 const ALLOWED_STYLES = new Set(['normal', 'retro', 'surveillance', 'thermal', 'anime', 'noir', 'snow']);
 const PANEL_ALIASES = new Map([
@@ -176,6 +179,12 @@ const LAYER_ALIASES = new Map([
   ['firms', 'local-firms'],
   ['fires', 'local-firms'],
   ['active fires', 'local-firms'],
+  ['conflicts', 'conflicts'],
+  ['conflict', 'conflicts'],
+  ['ucdp', 'conflicts'],
+  ['news', 'news'],
+  ['gdelt', 'news'],
+  ['headlines', 'news'],
 ]);
 
 const CITY_ALIASES = new Map([
@@ -1650,6 +1659,318 @@ export function formatTrackedEntityLabel(found, query = '') {
     || String(query);
 }
 
+/**
+ * Overlay-dot families the voice can inspect-dive: STATIC pins the camera
+ * flies to (not follows) with the same framing as the double-click dive and
+ * the command-rail chips. Explicit layerId or a generic spoken query routes
+ * here; the honesty contract holds — no record, no fly, no invented coords.
+ */
+const OVERLAY_DIVE_LAYERS = new Set(['conflicts', 'news', 'earthquakes']);
+
+/**
+ * Generic spoken queries → overlay family. Order matters: "a news story about
+ * the war" is a NEWS ask, so news is matched before conflicts, and a plain
+ * "event" only reaches earthquakes when no news/conflict word claimed it.
+ */
+const OVERLAY_GENERIC_PATTERNS = [
+  ['news', /\b(news|headlines?|articles?|stor(?:y|ies)|gdelt)\b/i],
+  ['conflicts', /\b(conflicts?|wars?|fighting|ucdp)\b/i],
+  ['earthquakes', /\b(earthquakes?|quakes?|seismic|events?)\b/i],
+];
+
+/** @returns {string|null} Overlay layer id a generic query names, or null. */
+function matchGenericOverlayFamily(query) {
+  for (const [layerId, pattern] of OVERLAY_GENERIC_PATTERNS) {
+    if (pattern.test(query)) return layerId;
+  }
+  return null;
+}
+
+/**
+ * Filler words stripped from a spoken query before overlay record matching —
+ * the family words themselves ("conflict", "news", "quake") and command
+ * chatter ("zoom", "that", "about"). What remains is the SPECIFIC part:
+ * "the Mali conflict" → ["mali"], "a conflict" → [] (generic).
+ */
+const OVERLAY_QUERY_FILLER = new Set([
+  'the', 'a', 'an', 'that', 'this', 'one', 'on', 'in', 'at', 'of', 'to',
+  'about', 'into', 'zoom', 'show', 'me', 'dive', 'inspect', 'tell', 'go',
+  'fly', 'near', 'nearest', 'latest', 'newest', 'biggest', 'some', 'any',
+  'point', 'pin', 'dot', 'spot', 'news', 'story', 'stories', 'headline',
+  'headlines', 'article', 'articles', 'gdelt', 'conflict', 'conflicts',
+  'war', 'wars', 'fighting', 'ucdp', 'event', 'events', 'earthquake',
+  'earthquakes', 'quake', 'quakes', 'seismic',
+]);
+
+/** Content tokens of a spoken query after overlay filler is stripped. */
+function overlayQueryTokens(query) {
+  return String(query || '').toLowerCase().split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 3 && !OVERLAY_QUERY_FILLER.has(token));
+}
+
+/**
+ * Best record whose named fields contain the query's content tokens
+ * (substring match, most hits wins). Null for a generic query (no content
+ * tokens) or when nothing matches — the caller then applies its family's
+ * own generic pick, never a guess.
+ */
+function matchOverlayRecord(records, query, fields) {
+  const tokens = overlayQueryTokens(query);
+  if (!tokens.length) return null;
+  let best = null;
+  let bestHits = 0;
+  for (const record of records) {
+    const hay = fields.map((field) => String(record?.[field] ?? '')).join(' ').toLowerCase();
+    let hits = 0;
+    for (const token of tokens) {
+      if (hay.includes(token)) hits += 1;
+    }
+    if (hits > bestHits) {
+      best = record;
+      bestHits = hits;
+    }
+  }
+  return best;
+}
+
+/** A record is divable only with finite coordinates — nulls stay grounded. */
+function overlayRecordGeolocated(record) {
+  return record != null && Number.isFinite(record.lat) && Number.isFinite(record.lon);
+}
+
+/**
+ * Turn an overlay layer on for a voice dive (same idea as the command rail's
+ * ensureLayerReady) and poll it once so records exist before matching.
+ * @returns {Promise<boolean>} Whether the layer is enabled afterwards.
+ */
+async function ensureOverlayLayerEnabled(dataManager, layerId) {
+  if (dataManager.isEnabled(layerId)) return true;
+  try {
+    await dataManager.setEnabled(layerId, true, { origin: 'voice' });
+  } catch {
+    return false;
+  }
+  try {
+    await dataManager.refreshLayer?.(layerId);
+  } catch { /* an empty feed surfaces as an honest empty below */ }
+  return Boolean(dataManager.isEnabled(layerId));
+}
+
+/** Framing range for a quake dive — same curve as the command-rail EVENTS chip. */
+function voiceQuakeRangeM(mag) {
+  return Math.min(60000, Math.max(12000, Math.pow(2, Number(mag) || 4) * 1500));
+}
+
+/** Honest empty for an overlay family whose feed has no usable record. */
+function overlayEmptyResult(query, layerId, error) {
+  return { ok: false, action: 'track_entity', query, layerId, error };
+}
+
+/**
+ * Voice dive onto a UCDP conflict point: specific query matches conflict/
+ * country/id; generic picks the deadliest (then newest) geolocated record.
+ * Same framing as the double-click `conflict:` dive.
+ */
+async function diveToConflict(viewer, dataManager, styleManager, query) {
+  if (!(await ensureOverlayLayerEnabled(dataManager, 'conflicts'))) {
+    return overlayEmptyResult(query, 'conflicts', 'The conflicts layer could not be enabled');
+  }
+  const module = dataManager.layers.get('conflicts')?.module;
+  const records = (module?.getAnalystRecords?.(2000) || []).filter(overlayRecordGeolocated);
+  if (!records.length) {
+    return overlayEmptyResult(query, 'conflicts', 'The conflicts layer is empty or not delivering geolocated events');
+  }
+  const target = matchOverlayRecord(records, query, ['conflict', 'country', 'id'])
+    || records.slice().sort((a, b) => (Number(b.deathsBest) || 0) - (Number(a.deathsBest) || 0)
+      || String(b.dateStart || '').localeCompare(String(a.dateStart || '')))[0];
+  return runManagedVoiceNavigation(styleManager, 'conflict', 'track_entity', () => {
+    try {
+      module.selectEvent?.(conflictEntityId(target.id));
+    } catch { /* selection is a bonus; the dive is the contract */ }
+    flyToLandmark(viewer, target.lat, target.lon, {
+      range: conflictRangeM(target.deathsBest), pitch: -50, heading: 0, buildingHeight: 0, duration: 2.2,
+    });
+    return {
+      ok: true,
+      action: 'track_entity',
+      kind: 'conflict',
+      layerId: 'conflicts',
+      label: target.conflict || 'Armed conflict',
+      latitude: target.lat,
+      longitude: target.lon,
+      deathsBest: target.deathsBest ?? null,
+      country: target.country ?? null,
+      dateStart: target.dateStart ?? null,
+      type: target.type ?? null,
+      briefing: conflictDiveBanner(target),
+    };
+  });
+}
+
+/**
+ * Voice dive onto a GDELT news pin: specific query matches title/domain/id;
+ * generic uses the focus record (same as the NEWS rail chip). Same framing as
+ * showNews. url comes off the loaded record — no new network.
+ */
+async function diveToNews(viewer, dataManager, styleManager, query) {
+  if (!(await ensureOverlayLayerEnabled(dataManager, 'news'))) {
+    return overlayEmptyResult(query, 'news', 'The news layer could not be enabled');
+  }
+  const module = dataManager.layers.get('news')?.module;
+  const records = (module?.getAnalystRecords?.(500) || module?.getRoster?.() || [])
+    .filter(overlayRecordGeolocated);
+  let target = matchOverlayRecord(records, query, ['title', 'domain', 'id']);
+  if (!target) {
+    const focus = module?.getFocusRecord?.();
+    if (overlayRecordGeolocated(focus)) target = focus;
+  }
+  if (!target) target = records[0] || null;
+  if (!target) {
+    return overlayEmptyResult(query, 'news', 'The news feed has no geolocated stories right now');
+  }
+  return runManagedVoiceNavigation(styleManager, 'news', 'track_entity', () => {
+    try {
+      module.selectEvent?.(target.entityId || newsEntityId(target.id));
+    } catch { /* selection is a bonus; the dive is the contract */ }
+    flyToLandmark(viewer, target.lat, target.lon, {
+      range: 180000, pitch: -55, heading: 0, buildingHeight: 0, duration: 2.4,
+    });
+    return {
+      ok: true,
+      action: 'track_entity',
+      kind: 'news',
+      layerId: 'news',
+      label: target.title || target.domain || 'World news',
+      latitude: target.lat,
+      longitude: target.lon,
+      title: target.title ?? null,
+      domain: target.domain ?? null,
+      seenMs: target.seenMs ?? null,
+      ageText: newsAgeText(target.seenMs),
+      url: target.url ?? null,
+      briefing: [target.title || 'World news', target.domain, newsAgeText(target.seenMs), 'GDELT']
+        .filter(Boolean).join(' · '),
+    };
+  });
+}
+
+/**
+ * Voice dive onto a USGS quake: specific query matches place/id; generic
+ * picks the newest M4.5+ geolocated event (same policy as the EVENTS chip).
+ */
+async function diveToQuake(viewer, dataManager, styleManager, query) {
+  if (!(await ensureOverlayLayerEnabled(dataManager, 'earthquakes'))) {
+    return overlayEmptyResult(query, 'earthquakes', 'The earthquakes layer could not be enabled');
+  }
+  const module = dataManager.layers.get('earthquakes')?.module;
+  const records = (module?.getAnalystRecords?.(2000) || []).filter(overlayRecordGeolocated);
+  if (!records.length) {
+    return overlayEmptyResult(query, 'earthquakes', 'The earthquakes layer is empty or not delivering geolocated events');
+  }
+  let target = matchOverlayRecord(records, query, ['place', 'id']);
+  if (!target) {
+    target = records
+      .filter((r) => Number.isFinite(r.magnitude) && r.magnitude >= 4.5)
+      .sort((a, b) => (b.timeMs || 0) - (a.timeMs || 0))[0] || null;
+  }
+  if (!target) {
+    return overlayEmptyResult(query, 'earthquakes', 'No M4.5+ earthquakes in the loaded window');
+  }
+  return runManagedVoiceNavigation(styleManager, 'earthquake', 'track_entity', () => {
+    try {
+      module.selectEvent?.(`earthquake:${target.id}`);
+    } catch { /* selection is a bonus; the dive is the contract */ }
+    flyToLandmark(viewer, target.lat, target.lon, {
+      range: voiceQuakeRangeM(target.magnitude), pitch: -50, heading: 0, buildingHeight: 0, duration: 2.4,
+    });
+    const mag = Number.isFinite(target.magnitude) ? Number(target.magnitude) : null;
+    return {
+      ok: true,
+      action: 'track_entity',
+      kind: 'earthquake',
+      layerId: 'earthquakes',
+      label: target.place || 'USGS event',
+      latitude: target.lat,
+      longitude: target.lon,
+      magnitude: mag,
+      place: target.place ?? null,
+      timeMs: target.timeMs ?? null,
+      briefing: [
+        mag !== null ? `M${mag.toFixed(1)}` : 'Magnitude unknown',
+        target.place || 'USGS event',
+        'USGS',
+      ].join(' · '),
+    };
+  });
+}
+
+/** Deictic spoken queries — "that", "this one", "the selected"… */
+const DEICTIC_QUERIES = new Set([
+  'that', 'this', 'it', 'that one', 'this one', 'that thing', 'this thing',
+  'selected', 'the selected', 'the selected one', 'the selected entity',
+  'the selected contact', 'the one i clicked', 'the one i clicked on',
+  'the one i selected', 'the one i just clicked',
+]);
+
+/** @returns {boolean} Whether the query points at the current selection. */
+function isDeicticQuery(query) {
+  const normalized = String(query || '').toLowerCase()
+    .replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  return DEICTIC_QUERIES.has(normalized);
+}
+
+/**
+ * Dive onto the currently selected contact with its family's framing —
+ * conflict/news/quake pins keep their dive framing, everything else gets the
+ * shared entity inspect frame (WORLD_FOCUS_FRAMING.entity). Honest empty when
+ * nothing geolocated is selected.
+ */
+function diveToSelectedContact(viewer, dataManager, styleManager, query) {
+  let selected = null;
+  try {
+    selected = getSelectedEntityContext({ dataManager });
+  } catch {
+    selected = null;
+  }
+  if (!selected || !Number.isFinite(selected.latitude) || !Number.isFinite(selected.longitude)) {
+    return { ok: false, action: 'track_entity', query, error: 'Nothing with a position is currently selected' };
+  }
+  const props = selected.properties || {};
+  let kind = 'entity';
+  let framing = {
+    range: WORLD_FOCUS_FRAMING.entity.rangeM,
+    pitch: WORLD_FOCUS_FRAMING.entity.pitchDeg,
+    duration: 2.0,
+  };
+  if (selected.layerId === 'conflicts') {
+    kind = 'conflict';
+    framing = { range: conflictRangeM(props.deathsBest), pitch: -50, duration: 2.2 };
+  } else if (selected.layerId === 'news') {
+    kind = 'news';
+    framing = { range: 180000, pitch: -55, duration: 2.4 };
+  } else if (selected.layerId === 'earthquakes') {
+    kind = 'earthquake';
+    framing = { range: voiceQuakeRangeM(props.mag ?? props.magnitude), pitch: -50, duration: 2.4 };
+  }
+  return runManagedVoiceNavigation(styleManager, kind, 'track_entity', () => {
+    flyToLandmark(viewer, selected.latitude, selected.longitude, {
+      range: framing.range, pitch: framing.pitch, heading: 0, buildingHeight: 0, duration: framing.duration,
+    });
+    return {
+      ok: true,
+      action: 'track_entity',
+      kind,
+      layerId: selected.layerId || null,
+      label: selected.label || 'Selected contact',
+      latitude: selected.latitude,
+      longitude: selected.longitude,
+      properties: props,
+      briefing: [selected.label, selected.layerName || selected.source]
+        .filter(Boolean).join(' · '),
+    };
+  });
+}
+
 /** Finds and tracks/selects an entity by spoken query across layer families. */
 async function trackEntity(viewer, dataManager, styleManager, args = {}) {
   const query = String(args.query || '').trim();
@@ -1681,7 +2002,25 @@ async function trackEntity(viewer, dataManager, styleManager, args = {}) {
     });
   }
 
+  // Deictic "zoom in on that / this / the selected one" dives on the current
+  // selection with its family's framing — no query matching needed.
+  if (isDeicticQuery(query)) {
+    return diveToSelectedContact(viewer, dataManager, styleManager, query);
+  }
+
   const requested = args.layerId ? normalizeLayerId(args.layerId) : null;
+
+  // Overlay dot families (conflicts / news pins / earthquakes): an explicit
+  // layerId or a generic spoken query ("a conflict", "the news", "an
+  // earthquake") dives the pin — fly with the double-click framing, not
+  // follow. The dive enables the layer when it is off.
+  const overlayFamily = OVERLAY_DIVE_LAYERS.has(requested)
+    ? requested
+    : (!requested ? matchGenericOverlayFamily(query) : null);
+  if (overlayFamily === 'conflicts') return diveToConflict(viewer, dataManager, styleManager, query);
+  if (overlayFamily === 'news') return diveToNews(viewer, dataManager, styleManager, query);
+  if (overlayFamily === 'earthquakes') return diveToQuake(viewer, dataManager, styleManager, query);
+
   const families = TRACKABLE_FAMILIES.filter((family) => !requested || family.layerId === requested);
   const skippedDisabled = [];
 
@@ -1732,6 +2071,27 @@ async function trackEntity(viewer, dataManager, styleManager, args = {}) {
         error: trackedOk ? null : 'Match found but tracking failed',
       };
     });
+  }
+
+  // Generic leftover: no moving contact matched, but an already-ENABLED
+  // overlay layer's records might — a news title, a conflict name, a quake
+  // place. Nothing is turned on for a query that never named a family; a hit
+  // dives with that family's own framing, a geolocated record or nothing.
+  if (!requested) {
+    const leftoverFamilies = [
+      ['news', ['title', 'domain', 'id'], diveToNews],
+      ['conflicts', ['conflict', 'country', 'id'], diveToConflict],
+      ['earthquakes', ['place', 'id'], diveToQuake],
+    ];
+    for (const [layerId, fields, dive] of leftoverFamilies) {
+      if (!dataManager.isEnabled(layerId)) continue;
+      const module = dataManager.layers.get(layerId)?.module;
+      const records = (module?.getAnalystRecords?.(2000) || module?.getRoster?.() || [])
+        .filter(overlayRecordGeolocated);
+      if (matchOverlayRecord(records, query, fields)) {
+        return dive(viewer, dataManager, styleManager, query);
+      }
+    }
   }
 
   const disabledNote = skippedDisabled.length ? ` (disabled layers skipped: ${skippedDisabled.join(', ')})` : '';

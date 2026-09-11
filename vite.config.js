@@ -6221,6 +6221,7 @@ export function openAiRealtimeProxy() {
           instructions: [
             "You are GEV Voice Control, a concise voice controller for a Cesium geospatial app called God's Eye View.",
             'Have a natural spoken conversation with the user while the mic session is active.',
+            'Always speak American English. Do not switch language because the map is over a French-speaking place, a French label, or a French-named voice. Only use another language if the user explicitly asks.',
             'Do not require a wake phrase. Treat direct commands like "zoom into London" or "open datacenters" as GEV control requests.',
             'Only control the app by calling the provided tools. Never invent tool names or arguments.',
             'Call tools only for clear GEV control, navigation, visual-style, layer, or app-state requests. For ordinary conversation, answer normally without tools.',
@@ -6266,6 +6267,7 @@ export function openAiRealtimeProxy() {
             'Bloom/sharpen requests use set_post_processing. Scene requests ("play orbital watch", "stop the scene", "what scenes are there") use control_scene. CCTV camera requests ("next camera", "nearest camera", "select the Congress camera", "show coverage") use control_cctv — the CCTV layer must be enabled first.',
             'Radio playback requests use control_radio. "Turn on/start the radio" means action=play; action=enable only reveals Radio markers and must be reserved for explicit "show/enable the Radio layer/markers" requests. After a prepared playback result, briefly confirm any other completed actions and say "Turning on the radio"—never claim it is already playing. The client keeps Radio muted until playback is verified, then closes voice before restoring Radio volume. Examples: "play news near Austin" → select category=news locationId=austin; "play US news" → select category=news country=US; "Radio volume 30" → volume; pause/resume/stop/next/previous use the matching action. Radio selection never moves the camera.',
             '"Track/follow <something specific>" (a callsign, ship name, satellite name) uses track_entity. "Take me to the biggest fire" uses track_entity with query "biggest fire" (the fires layer must be enabled). Bare "orbit" means camera orbit of the current landmark. "Stop following/tracking" uses stop_tracking.',
+            'ZOOM/INSPECT/TELL-ME-ABOUT a visible contact — named or generic: a conflict point, a news story, an earthquake, a fire, a plane, a ship, a dam, anything on the globe ("zoom in on a conflict", "zoom in on the news", "tell me about that story", "an earthquake") — means track_entity. Do not say you cannot zoom to it. If the layer is off, still call track_entity — it enables the layer itself. Named cities and places still use fly_to_location. After ok=true, give a short briefing from the tool result fields (title, place, deaths, date, domain, magnitude — whatever is present); on ok=false state the honest empty from error.',
             '"Show me which planes are overhead"/"frame the ships"/"show me the satellites above" use frame_overhead with the matching target.',
             "After frame_overhead, speak ONLY from the tool result's count field — e.g. 'Framed fourteen aircraft, labels on'; never reassess or second-guess the count aloud.",
             'Confirmations echo the RESULTING state, never the request: "HUD operator layout", "Density twenty-five percent", "Bing aerial imagery", "Tracking UAL428", "Framed fourteen aircraft". On ok=false, state the failure plainly: "Nothing matched UAL999", "No ships within 120 kilometers". Never claim an action without ok=true in the tool result.',
@@ -7075,13 +7077,13 @@ const GEV_REALTIME_TOOLS = [
   {
     type: 'function',
     name: 'track_entity',
-    description: 'Find and follow a specific aircraft (callsign/ICAO hex), ship (name/MMSI), or satellite (name/NORAD id) on enabled layers. Camera follows the entity.',
+    description: 'Find and follow a moving contact — aircraft (callsign/ICAO hex), ship (name/MMSI), satellite (name/NORAD id) — OR inspect-dive a geolocated overlay contact: fires, armed-conflict points, news pins, earthquakes, and other dots on the globe. Generic asks like "zoom in on a conflict", "zoom in on the news", "an earthquake" are this tool; it enables the layer if it is off. After ok=true, speak a short briefing from the returned fields (label, briefing, deaths, magnitude, domain, date).',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        query: { type: 'string', description: 'Callsign, ship name, satellite name, ICAO hex, MMSI, or NORAD id.' },
-        layerId: { type: 'string', description: 'Optional layer hint: flights | military | ais-live-vessels | satellites.' },
+        query: { type: 'string', description: 'Callsign, ship name, satellite name, ICAO hex, MMSI, NORAD id, conflict/country name, news title words, quake place — or a generic phrase like "a conflict", "the news", "an earthquake", "that story".' },
+        layerId: { type: 'string', description: 'Optional layer hint: flights | military | ais-live-vessels | satellites | conflicts | news | earthquakes.' },
       },
       required: ['query'],
     },

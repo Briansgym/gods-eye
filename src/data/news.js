@@ -312,6 +312,28 @@ export function createNewsLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = {}) {
     /** Select one pin by entity id (roster rows and the NEWS chip share it). */
     selectEvent,
 
+    /**
+     * Snapshot the loaded geolocated articles as plain JSON (same seam as
+     * conflicts.getAnalystRecords) so the double-click `news:` dive and the
+     * voice inspect-dive read the SAME records. On-demand only; [] when the
+     * layer is disabled or empty. No new network — these are the loaded pins.
+     * @param {number} [maxCount=500]
+     * @returns {Array<{id:string,title:string|null,domain:string|null,url:string|null,lat:number,lon:number,seenMs:number|null}>}
+     */
+    getAnalystRecords(maxCount = 500) {
+      if (!_dataSource || !_dataSource.show) return [];
+      const limit = Number.isFinite(maxCount) ? Math.max(1, Math.floor(maxCount)) : 500;
+      return _records.slice(0, limit).map((record) => ({
+        id: String(record.id),
+        title: record.title ?? null,
+        domain: record.domain ?? null,
+        url: record.url ?? null,
+        lat: record.lat,
+        lon: record.lon,
+        seenMs: record.seenMs ?? null,
+      }));
+    },
+
     getStats() {
       return {
         count: _count,

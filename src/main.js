@@ -39,8 +39,19 @@ import { installScopeMask } from './scopeMask.js';
 import { initFirstRunExperience } from './firstRunExperience.js';
 import { initKeySetup } from './keySetup.js';
 import { loadPhotorealisticTileset } from './mapStartup.js';
+import { installMapsSpendMonitor } from './maps/mapsSpendMonitor.js';
+import { initSpendHud } from './spendHud.js';
+
+// Maps spend meter — MUST install before any Cesium/tileset code runs so the
+// very first Google 3D-tile request (fetch AND XHR) is already counted. Pure
+// instrumentation: requests are never blocked or altered, and there is no
+// hard kill for Maps — the HUD readout just turns amber past the threshold.
+installMapsSpendMonitor();
 
 initLogoGaze();
+// Always-on bottom-left VOICE/MAPS session-spend readout. Independent of the
+// military intel HUD; sits above the required #cesium-credits attribution.
+initSpendHud();
 
 /**
  * Extract a human-readable error message from any thrown value.

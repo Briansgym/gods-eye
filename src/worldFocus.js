@@ -9,6 +9,10 @@ export const WORLD_CLICK_FOCUS_DURATION_SEC = 1.9;
 export const WORLD_FOCUS_FRAMING = Object.freeze({
   vessel: Object.freeze({ radiusM: 150, rangeM: 1200, pitchDeg: -30 }),
   fire: Object.freeze({ radiusM: 400, rangeM: 3000, pitchDeg: -35 }),
+  // Generic contact/infrastructure dot (dams, datacenters, cables, military
+  // installations, …): a local inspect view — close enough to read the site,
+  // far enough to keep its surroundings (double-click dive, brief 2026-09-11).
+  entity: Object.freeze({ radiusM: 300, rangeM: 3500, pitchDeg: -35 }),
 });
 
 /** Validate a layer-owned focus target before camera policy can release tracking. */
@@ -20,7 +24,7 @@ export function isValidWorldFocusTarget(detail) {
     || !Number.isFinite(position.x)
     || !Number.isFinite(position.y)
     || !Number.isFinite(position.z)) return false;
-  // Vessel and fire targets are surface-anchored Earth positions. Merely
+  // Focus targets are (near-)surface-anchored Earth positions. Merely
   // finite coordinates near the ECEF origin cannot be flown to, and must be
   // rejected before the camera policy releases a current follow owner.
   const magnitude = Cesium.Cartesian3.magnitude(position);

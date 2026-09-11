@@ -58,6 +58,7 @@ function feedStateFor(layerId, dataManager) {
 
 /** Status banner for the rail. Returns null when the DOM host is absent. */
 function chipBanner() {
+  if (typeof document === 'undefined') return null;
   const el = document.getElementById('command-rail-status');
   if (!el) return null;
   return {
@@ -347,6 +348,171 @@ function pickedTextId(picked) {
   return String(raw);
 }
 
+/** Loose Cesium Property reader — constants and raw values both resolve. */
+function readGraphicsValue(value, time) {
+  if (!value) return null;
+  return typeof value.getValue === 'function' ? value.getValue(time) : value;
+}
+
+/** A cartesian is divable only when finite and at Earth-surface scale. */
+function usableCartesian(position) {
+  if (!position
+    || !Number.isFinite(position.x)
+    || !Number.isFinite(position.y)
+    || !Number.isFinite(position.z)) return null;
+  const magnitude = Cesium.Cartesian3.magnitude(position);
+  return magnitude >= Cesium.Ellipsoid.WGS84.minimumRadius * 0.95 ? position : null;
+}
+
+/**
+ * Resolve a world position from any scene pick, in preference order: local
+ * stem base (the dot's true ground anchor, not its 2 km label tip), polyline
+ * base, entity position, polygon center, then billboard/point primitive
+ * position. Exported for the double-click dive test.
+ * @returns {Cesium.Cartesian3|null} Divable position, or null (no-op pick).
+ */
+export function pickedWorldPosition(picked, time = Cesium.JulianDate.now()) {
+  if (!picked) return null;
+  const entity = picked.id && typeof picked.id === 'object' ? picked.id : null;
+  const candidates = [];
+  if (entity) {
+    candidates.push(entity.__localBaseCartesian);
+    const linePositions = readGraphicsValue(entity.polyline?.positions, time);
+    if (Array.isArray(linePositions)) candidates.push(linePositions[0]);
+    candidates.push(readGraphicsValue(entity.position, time));
+    const hierarchy = readGraphicsValue(entity.polygon?.hierarchy, time);
+    if (Array.isArray(hierarchy?.positions) && hierarchy.positions.length) {
+      candidates.push(Cesium.BoundingSphere.fromPoints(hierarchy.positions).center);
+    }
+  }
+  candidates.push(picked.primitive?.position);
+  candidates.push(picked.position);
+  for (const candidate of candidates) {
+    const usable = usableCartesian(candidate);
+    if (usable) return usable;
+  }
+  return null;
+}
+
+/**
+ * One double-click dive attempt. Known families keep their inspect/track/
+ * select/banner side effects; EVERY other pick that resolves a world position
+ * (dams, datacenters, fires, cables, installations, …) dives via the shared
+ * `entity` world-focus framing. Empty pick / no position → no-op.
+ *
+ * Exported for tests; `focus`/`fly`/`banner` are injectable seams only.
+ * @returns {string|null} What dove ('vessel'|'aircraft'|'satellite'|
+ *   'earthquake'|'conflict'|'news'|'entity'), or null when nothing did.
+ */
+export function diveOnPick(gev, picked, {
+  banner = chipBanner(),
+  focus = requestWorldFocus,
+  fly = flyToLandmark,
+} = {}) {
+  if (!gev?.dataManager || !gev?.viewer || !picked) return null;
+  const text = pickedTextId(picked);
+  if (text) {
+    for (const family of DIVE_FAMILIES) {
+      const module = gev.dataManager.layers.get(family.layerId)?.module;
+      if (!module) continue;
+      try {
+        if (family.kind === 'vessel') {
+          if (!module.selectById?.(text)) continue;
+          const info = module.getSelectedInfo?.();
+          focus({
+            kind: 'vessel',
+            id: String(text),
+            label: info?.name || text,
+            position: info && Number.isFinite(info.latitude) && Number.isFinite(info.longitude)
+              ? Cesium.Cartesian3.fromDegrees(info.longitude, info.latitude)
+              : null,
+          });
+          banner?.show(`Inspecting ${info?.name || text} — AISStream · ${ageText(module.getStats?.()?.lastUpdate)}`, 'ok');
+          return 'vessel';
+        }
+        if (family.kind === 'aircraft') {
+          if (!module.trackById?.(text, { origin: 'user' })) continue;
+          // Tracking alone can leave the camera at globe scale (notably when
+          // the aircraft was already tracked, which only re-publishes the
+          // selection) — reapply the canonical follow frame so double-click
+          // always lands the close inspect view.
+          module.refocusTrackedById?.(text, { origin: 'user' });
+          const tracked = module.getTrackedInfo?.();
+          banner?.show(`Inspecting ${tracked?.callsign || text} — OpenSky · live`, 'ok');
+          return 'aircraft';
+        }
+        if (Number.isFinite(Number(text)) && module.trackById?.(Number(text), { origin: 'user' })) {
+          banner?.show(`Inspecting ${text} — CelesTrak · live orbit`, 'ok');
+          return 'satellite';
+        }
+      } catch { /* sibling mismatch — try next family */ }
+    }
+    // Earthquake entities carry id "earthquake:<usgsId>"
+    if (text.startsWith('earthquake:')) {
+      const module = gev.dataManager.layers.get('earthquakes')?.module;
+      const records = module?.getAnalystRecords?.(2000) || [];
+      const wanted = text.slice('earthquake:'.length);
+      const match = records.find((r) => String(r.id) === wanted || String(r.id) === text);
+      if (match && Number.isFinite(match.lat) && Number.isFinite(match.lon)) {
+        fly(gev.viewer, match.lat, match.lon, {
+          range: quakeRangeM(match.magnitude),
+          pitch: -50,
+          duration: 2.2,
+        });
+        banner?.show(`M${Number(match.magnitude).toFixed(1)} — ${match.place || 'USGS event'} · USGS · ${ageText(match.timeMs)}`, 'ok');
+        return 'earthquake';
+      }
+    }
+    // Conflicts entities carry id "conflict:<ucdpId>" — dive + inspect banner.
+    if (text.startsWith('conflict:')) {
+      const module = gev.dataManager.layers.get('conflicts')?.module;
+      const records = module?.getAnalystRecords?.(2000) || [];
+      const match = resolveConflictDive(records, text);
+      if (match) {
+        fly(gev.viewer, match.lat, match.lon, {
+          range: conflictRangeM(match.deathsBest),
+          pitch: -50,
+          duration: 2.2,
+        });
+        banner?.show(conflictDiveBanner(match), 'ok');
+        return 'conflict';
+      }
+      banner?.show('CONFLICT — record not geolocated in the UCDP feed.', 'empty');
+    }
+    // News pins carry id "news:<articleId>" — fly + inspect banner.
+    if (text.startsWith('news:')) {
+      const module = gev.dataManager.layers.get('news')?.module;
+      const records = module?.getAnalystRecords?.(500) || [];
+      const wanted = text.slice('news:'.length);
+      const match = records.find((r) => String(r.id) === wanted);
+      if (match && Number.isFinite(match.lat) && Number.isFinite(match.lon)) {
+        fly(gev.viewer, match.lat, match.lon, {
+          range: 140000,
+          pitch: -50,
+          duration: 2.2,
+        });
+        banner?.show(`${match.title || 'WORLD NEWS'} — ${match.domain || 'GDELT'} · ${ageText(match.seenMs)}`, 'ok');
+        return 'news';
+      }
+    }
+  }
+  // Generic dive: any other pickable dot (or a prefixed pick whose record was
+  // missing above) still zooms — the position comes from the pick itself.
+  const position = pickedWorldPosition(picked);
+  if (!position) return null;
+  const entityName = typeof picked.id === 'object' ? String(picked.id?.name || '').trim() : '';
+  const label = entityName || text || 'CONTACT';
+  const flew = focus({
+    kind: 'entity',
+    id: text || label,
+    label,
+    position,
+  });
+  if (!flew) return null;
+  banner?.show(`Inspecting ${label}`, 'ok');
+  return 'entity';
+}
+
 /**
  * Double-click a contact dot: dive + inspect via the layer's own select
  * machinery (which also feeds the side tab / readout). Registered once.
@@ -360,84 +526,7 @@ function installDoubleClickDive(viewer) {
     if (!gev?.dataManager || !gev?.viewer) return;
     const picked = gev.viewer.scene.pick(click.position);
     if (!picked) return;
-    const text = pickedTextId(picked);
-    if (!text) return;
-    for (const family of DIVE_FAMILIES) {
-      const module = gev.dataManager.layers.get(family.layerId)?.module;
-      if (!module) continue;
-      try {
-        if (family.kind === 'vessel') {
-          if (!module.selectById?.(text)) continue;
-          const info = module.getSelectedInfo?.();
-          requestWorldFocus({
-            kind: 'vessel',
-            id: String(text),
-            label: info?.name || text,
-            position: info && Number.isFinite(info.latitude) && Number.isFinite(info.longitude)
-              ? Cesium.Cartesian3.fromDegrees(info.longitude, info.latitude)
-              : null,
-          });
-          chipBanner()?.show(`Inspecting ${info?.name || text} — AISStream · ${ageText(module.getStats?.()?.lastUpdate)}`, 'ok');
-          return;
-        }
-        if (family.kind === 'aircraft') {
-          if (!module.trackById?.(text, { origin: 'user' })) continue;
-          const tracked = module.getTrackedInfo?.();
-          chipBanner()?.show(`Inspecting ${tracked?.callsign || text} — OpenSky · live`, 'ok');
-          return;
-        }
-        if (Number.isFinite(Number(text)) && module.trackById?.(Number(text), { origin: 'user' })) {
-          chipBanner()?.show(`Inspecting ${text} — CelesTrak · live orbit`, 'ok');
-          return;
-        }
-      } catch { /* sibling mismatch — try next family */ }
-    }
-    // Earthquake entities carry id "earthquake:<usgsId>"
-    if (text.startsWith('earthquake:')) {
-      const module = gev.dataManager.layers.get('earthquakes')?.module;
-      const records = module?.getAnalystRecords?.(2000) || [];
-      const wanted = text.slice('earthquake:'.length);
-      const match = records.find((r) => String(r.id) === wanted || String(r.id) === text);
-      if (match && Number.isFinite(match.lat) && Number.isFinite(match.lon)) {
-        flyToLandmark(gev.viewer, match.lat, match.lon, {
-          range: quakeRangeM(match.magnitude),
-          pitch: -50,
-          duration: 2.2,
-        });
-        chipBanner()?.show(`M${Number(match.magnitude).toFixed(1)} — ${match.place || 'USGS event'} · USGS · ${ageText(match.timeMs)}`, 'ok');
-      }
-    }
-    // Conflicts entities carry id "conflict:<ucdpId>" — dive + inspect banner.
-    if (text.startsWith('conflict:')) {
-      const module = gev.dataManager.layers.get('conflicts')?.module;
-      const records = module?.getAnalystRecords?.(2000) || [];
-      const match = resolveConflictDive(records, text);
-      if (match) {
-        flyToLandmark(gev.viewer, match.lat, match.lon, {
-          range: conflictRangeM(match.deathsBest),
-          pitch: -50,
-          duration: 2.2,
-        });
-        chipBanner()?.show(conflictDiveBanner(match), 'ok');
-      } else {
-        chipBanner()?.show('CONFLICT — record not geolocated in the UCDP feed.', 'empty');
-      }
-    }
-    // News pins carry id "news:<articleId>" — fly + inspect banner.
-    if (text.startsWith('news:')) {
-      const module = gev.dataManager.layers.get('news')?.module;
-      const records = module?.getAnalystRecords?.(500) || [];
-      const wanted = text.slice('news:'.length);
-      const match = records.find((r) => String(r.id) === wanted);
-      if (match && Number.isFinite(match.lat) && Number.isFinite(match.lon)) {
-        flyToLandmark(gev.viewer, match.lat, match.lon, {
-          range: 140000,
-          pitch: -50,
-          duration: 2.2,
-        });
-        chipBanner()?.show(`${match.title || 'WORLD NEWS'} — ${match.domain || 'GDELT'} · ${ageText(match.seenMs)}`, 'ok');
-      }
-    }
+    diveOnPick(gev, picked);
   }, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
 }
 
