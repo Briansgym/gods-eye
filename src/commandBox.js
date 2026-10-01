@@ -38,10 +38,20 @@ export function parseCommandBoxInput(raw) {
     return { kind: 'chip', id: lower };
   }
 
-  match = text.match(/^(?:fly|go)\s+to\s+(.+)$/i);
+  match = text.match(/^(?:fly|go)\s+to\s+(.+)$/i) || text.match(/^take\s+me\s+to\s+(.+)$/i);
   if (match) {
     const query = match[1].replace(/[.!?]+$/, '').trim();
     return query
+      ? { kind: 'fly', query }
+      : { kind: 'unknown', text };
+  }
+
+  // 'fly X' / 'go X' with the 'to' missing. A bare trailing 'to' (e.g.
+  // 'fly to ') is not a place — that stays unknown.
+  match = text.match(/^(?:fly|go)\s+(.+)$/i);
+  if (match) {
+    const query = match[1].replace(/[.!?]+$/, '').trim();
+    return query && query.toLowerCase() !== 'to'
       ? { kind: 'fly', query }
       : { kind: 'unknown', text };
   }
@@ -50,6 +60,19 @@ export function parseCommandBoxInput(raw) {
   if (match) return { kind: 'cctv', on: match[1].toLowerCase() === 'on' };
 
   if (lower === 'contacts' || lower === 'contact') return { kind: 'contacts' };
+
+  // Bare place name: nothing above matched and the line does not start with a
+  // command verb, so treat the whole text as a fly query ('Sedalia Missouri').
+  // Verb-led leftovers ('find me a sandwich', 'ships and planes') stay unknown.
+  const COMMAND_VERBS = new Set([
+    'fly', 'go', 'show', 'open', 'cctv', 'contacts', 'contact',
+    'ships', 'planes', 'events', 'news', 'take', 'find',
+  ]);
+  const firstWord = lower.split(' ', 1)[0];
+  if (!COMMAND_VERBS.has(firstWord)) {
+    const query = text.replace(/[.!?]+$/, '').trim();
+    if (query) return { kind: 'fly', query };
+  }
 
   return { kind: 'unknown', text };
 }

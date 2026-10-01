@@ -35,6 +35,18 @@ test('fly vocabulary: fly/go to <place>, punctuation tolerated', () => {
   assert.deepEqual(parseCommandBoxInput('fly to  '), { kind: 'unknown', text: 'fly to' });
 });
 
+test('fly vocabulary: missing "to" and "take me to" still fly', () => {
+  assert.deepEqual(parseCommandBoxInput('fly london'), { kind: 'fly', query: 'london' });
+  assert.deepEqual(parseCommandBoxInput('go Paris'), { kind: 'fly', query: 'Paris' });
+  assert.deepEqual(parseCommandBoxInput('take me to Kansas City'), { kind: 'fly', query: 'Kansas City' });
+});
+
+test('bare place names fly without any prefix', () => {
+  assert.deepEqual(parseCommandBoxInput('Sedalia Missouri'), { kind: 'fly', query: 'Sedalia Missouri' });
+  assert.deepEqual(parseCommandBoxInput('green ridge missouri'), { kind: 'fly', query: 'green ridge missouri' });
+  assert.deepEqual(parseCommandBoxInput('Tokyo'), { kind: 'fly', query: 'Tokyo' });
+});
+
 test('cctv on/off and contacts exit', () => {
   assert.deepEqual(parseCommandBoxInput('cctv on'), { kind: 'cctv', on: true });
   assert.deepEqual(parseCommandBoxInput('CCTV OFF'), { kind: 'cctv', on: false });
@@ -46,8 +58,8 @@ test('unknown phrases are flagged, not guessed', () => {
   assert.equal(out.kind, 'unknown');
   assert.equal(out.text, 'find me a sandwich');
   assert.equal(parseCommandBoxInput('ships and planes').kind, 'unknown');
-  assert.equal(parseCommandBoxInput('fly london').kind, 'unknown');
   assert.equal(parseCommandBoxInput('cctv').kind, 'unknown');
+  assert.equal(parseCommandBoxInput('take me home').kind, 'unknown');
 });
 
 test('fly outcome: success reports the geocode label', async () => {

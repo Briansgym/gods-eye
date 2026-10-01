@@ -41,6 +41,19 @@ export function conflictEntityId(recordId) {
 }
 
 /**
+ * Map a world-overlay entry id back to the layer's entity id vocabulary.
+ * Overlay entries are keyed by the bare UCDP event id (`String(record.id)`),
+ * while entities are `conflict:<id>` — accept either, reject empties.
+ * @param {string|null} entryId Overlay entry id from a hit test.
+ * @returns {string|null} Canonical `conflict:<id>` entity id, or null.
+ */
+export function conflictEntityIdFromOverlayEntryId(entryId) {
+  if (entryId === null || entryId === undefined || entryId === '') return null;
+  const id = String(entryId);
+  return id.startsWith('conflict:') ? id : conflictEntityId(id);
+}
+
+/**
  * Camera range for a conflict dive: 18 km floor, 90 km ceiling, sqrt-scaled by
  * fatalities in between (deadlier event → wider framing, same shape as the
  * marker-size curve).
@@ -132,7 +145,7 @@ export function createConflictOverlayEntry({ id, position, best, accent }) {
     priority: Math.round(deaths * 100 + 50),
     collisionGroup: 'ambient-label',
     paintLane: 'ambient-label',
-    interactive: false,
+    interactive: true,
     edgeFade: 'keyhole',
     horizonCull: true,
     terrainOcclusion: false,

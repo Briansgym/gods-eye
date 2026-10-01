@@ -4,12 +4,14 @@
 // pure decisions; nothing here touches network or DOM.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as Cesium from 'cesium';
 
 import { mapConflictRow, parseConflictCsv, parseCsv } from './conflictsCsv.js';
 import {
   CONFLICTS_OVERLAY_COHORT_LIMIT,
   conflictDiveBanner,
   conflictEntityId,
+  conflictEntityIdFromOverlayEntryId,
   conflictPixelSize,
   conflictRangeM,
   conflictTypeLabel,
@@ -18,6 +20,7 @@ import {
   selectConflictOverlayCohort,
 } from './conflictsModel.js';
 import { REGISTERED_LAYER_IDS } from './layerState.js';
+import { createConflictsLayer } from './conflicts.js';
 
 const HEADER_ROW = 'id,relid,year,type_of_violence,conflict_name,dyad_name,side_a,side_b,'
   + 'where_coordinates,adm_1,country,region,latitude,longitude,date_start,date_end,'
@@ -98,12 +101,120 @@ test('marker size scales with fatalities inside a 7..13 band and selection wins'
   assert.equal(conflictPixelSize(0, true), 13);
 });
 
+test('overlay entries are interactive so label clicks enter the hit rects', () => {
+  const entry = createConflictOverlayEntry({ id: '628272', position: {}, best: 5, accent: '#ffee58' });
+  assert.equal(entry.interactive, true);
+});
+
+test('overlay entry ids map back to conflict entity ids', () => {
+  assert.equal(conflictEntityIdFromOverlayEntryId('628272'), 'conflict:628272');
+  assert.equal(conflictEntityIdFromOverlayEntryId('conflict:628272'), 'conflict:628272');
+  assert.equal(conflictEntityIdFromOverlayEntryId(null), null);
+  assert.equal(conflictEntityIdFromOverlayEntryId(''), null);
+});
+
 test('entity ids and type labels are stable vocabulary', () => {
   assert.equal(conflictEntityId(628272), 'conflict:628272');
   assert.equal(conflictTypeLabel(1), 'STATE-BASED');
   assert.equal(conflictTypeLabel(2), 'NON-STATE');
   assert.equal(conflictTypeLabel(3), 'ONE-SIDED');
   assert.equal(conflictTypeLabel(null), 'ARMED CONFLICT');
+});
+
+test('the layer object exposes selectEvent, same seam as news (voice/dive call it)', () => {
+  const layer = createConflictsLayer({
+    overlayHost: { setEntries() {}, setVisible() {}, clearSource() {}, hitTest: () => null },
+  });
+  assert.equal(typeof layer.selectEvent, 'function');
+  // Unknown / unloaded ids report an honest false, never a throw.
+  assert.equal(layer.selectEvent('conflict:never-loaded'), false);
+});
+
+// SELECTION MUST NOT REBUILD OVERLAY ENTRIES (live-reproduced 2026-09-12):
+// Cesium fires LEFT_CLICK then LEFT_DOUBLE_CLICK. The click's selectEvent used
+// to renderRecords() → overlayHost.setEntries() → the world overlay wiped its
+// painted hit rects — so the double-click of the SAME gesture hit-tested empty
+// rects and the dive died. Selection restyles the point in place instead.
+test('selectEvent restyles the point in place and never rebuilds overlay entries', async (t) => {
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  const originalFetch = globalThis.fetch;
+  // contextStore hangs its store + selection events off window; the click
+  // handler install path wants a document for Cesium's event plumbing.
+  globalThis.window = { dispatchEvent() {} };
+  globalThis.document = originalDocument || { addEventListener() {}, removeEventListener() {} };
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      total: 2,
+      events: [
+        {
+          id: 628272, type: 3, conflict: 'Sahel insurgency', dyad: 'd', sideA: 'a', sideB: 'b',
+          where: 'w', country: 'Mali', region: 'Africa', lat: 14.5, lon: -1.5,
+          dateStart: '2026-06-04 00:00:00.000', dateEnd: '2026-06-04 00:00:00.000',
+          deathsCivilians: 0, best: 12, high: 12, low: 12,
+        },
+        {
+          id: 999001, type: 1, conflict: 'Second front', dyad: 'd2', sideA: 'a', sideB: 'b',
+          where: 'w2', country: 'Afghanistan', region: 'Asia', lat: 35.1, lon: 67.6,
+          dateStart: '2026-05-05 00:00:00.000', dateEnd: '2026-05-05 00:00:00.000',
+          deathsCivilians: 0, best: 2, high: 2, low: 2,
+        },
+      ],
+    }),
+  });
+  t.after(() => {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+    globalThis.fetch = originalFetch;
+  });
+
+  let setEntriesCalls = 0;
+  const layer = createConflictsLayer({
+    overlayHost: {
+      setEntries() { setEntriesCalls += 1; },
+      setVisible() {},
+      clearSource() {},
+      hitTest: () => null,
+    },
+  });
+  let dataSource = null;
+  const viewer = {
+    dataSources: { add(ds) { dataSource = ds; }, remove() {} },
+    scene: {
+      canvas: {
+        addEventListener() {},
+        removeEventListener() {},
+        disableRootEvents: true,
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
+      },
+    },
+  };
+  layer.init(viewer);
+  layer.enable(viewer);
+  assert.equal(await layer.update(), true);
+  assert.equal(setEntriesCalls, 1, 'the data load paints the overlay exactly once');
+  assert.equal(layer.getSelectedId(), null);
+
+  // First click of the double-click gesture: label hit → selectEvent.
+  assert.equal(layer.selectEvent('conflict:628272'), true);
+  assert.equal(layer.getSelectedId(), 'conflict:628272');
+  assert.equal(setEntriesCalls, 1, 'selection must not call overlayHost.setEntries (wipes hit rects)');
+  const time = Cesium.JulianDate.now();
+  const selectedPoint = dataSource.entities.getById('conflict:628272').point;
+  assert.equal(selectedPoint.pixelSize.getValue(time), conflictPixelSize(12, true));
+  assert.ok(Cesium.Color.WHITE.equals(selectedPoint.color.getValue(time)));
+
+  // Second overlay hitTest-shaped click of the same gesture: same seam.
+  assert.equal(layer.selectEvent('conflict:628272'), true);
+  assert.equal(setEntriesCalls, 1, 'call count unchanged from the initial render');
+
+  // Moving the selection restyles both points in place — still no rebuild.
+  assert.equal(layer.selectEvent('conflict:999001'), true);
+  assert.equal(layer.getSelectedId(), 'conflict:999001');
+  assert.equal(setEntriesCalls, 1);
+  assert.equal(selectedPoint.pixelSize.getValue(time), conflictPixelSize(12, false));
+  assert.ok(!Cesium.Color.WHITE.equals(selectedPoint.color.getValue(time)));
 });
 
 test('the conflicts layer is registered in the sealed layer-state registry', () => {

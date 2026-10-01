@@ -1,10 +1,15 @@
 import * as Cesium from 'cesium';
 import {
   clearOverlaySource,
+  hitTestWorldOverlay,
   setOverlayEntries,
   setOverlaySourceVisible,
 } from '../overlays/worldOverlay.js';
-import { registerEntityContext, selectEntityContext } from './contextStore.js';
+import {
+  clearSelectedEntityContextForLayer,
+  registerEntityContext,
+  selectEntityContext,
+} from './contextStore.js';
 import {
   isOwnedByOtherLayer,
   registerPickOwner,
@@ -17,6 +22,7 @@ import {
   CONFLICTS_OVERLAY_COLLISION_CAPACITY,
   CONFLICTS_OVERLAY_SOURCE_ID,
   conflictEntityId,
+  conflictEntityIdFromOverlayEntryId,
   conflictTypeAccent,
   conflictTypeLabel,
   conflictPixelSize,
@@ -45,6 +51,7 @@ const DEFAULT_OVERLAY_HOST = Object.freeze({
   setEntries: setOverlayEntries,
   setVisible: setOverlaySourceVisible,
   clearSource: clearOverlaySource,
+  hitTest: hitTestWorldOverlay,
 });
 
 export function createConflictsLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = {}) {
@@ -166,19 +173,45 @@ export function createConflictsLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = {}
     }
   }
 
+  /**
+   * Restyle one marker's point for its selection state IN PLACE (pixelSize +
+   * color only). Selection must NEVER rebuild entities or overlay entries:
+   * overlayHost.setEntries wipes the overlay's painted hit rects, and the
+   * LEFT_CLICK select runs inside the same gesture as the LEFT_DOUBLE_CLICK
+   * dive — a rebuild here left the double-click hit-testing empty rects and
+   * killed the dive (live-reproduced 2026-09-12). renderRecords() is for
+   * data loads (update()/enable) only.
+   */
+  function styleSelection(entityId, selected) {
+    const entity = _dataSource?.entities.getById(entityId);
+    const record = _recordById.get(entityId);
+    if (!entity?.point || !record) return;
+    entity.point.pixelSize = conflictPixelSize(record.best, selected);
+    entity.point.color = selected
+      ? Cesium.Color.WHITE
+      : Cesium.Color.fromCssColorString(conflictTypeAccent(record.type));
+  }
+
   /** Select one conflict marker and surface it in the shared context store. */
   function selectEvent(entityId) {
     const record = _recordById.get(entityId);
     if (!record || !_dataSource) return false;
+    const entity = _dataSource.entities.getById(entityId);
+    if (!entity) return false;
+    if (_selectedId && _selectedId !== entityId) styleSelection(_selectedId, false);
     _selectedId = entityId;
-    renderRecords();
-    return _selectedId === entityId;
+    styleSelection(entityId, true);
+    selectEntityContext(entity);
+    governorRequestRender('conflicts-select');
+    return true;
   }
 
   function clearSelection() {
     if (!_selectedId) return;
+    styleSelection(_selectedId, false);
     _selectedId = null;
-    renderRecords();
+    clearSelectedEntityContextForLayer('conflicts');
+    governorRequestRender('conflicts-select');
   }
 
   /** LEFT_CLICK: own picks select; sibling picks are left alone; empty clears. */
@@ -194,6 +227,19 @@ export function createConflictsLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = {}
         return;
       }
       if (pickId && isOwnedByOtherLayer('conflicts', pickId)) return;
+      // The Cesium point sits ~15 px below the ambient fatality label, so a
+      // click on the label misses scene.pick — fall back to the overlay's
+      // painted hit rects (same pattern as the FIRMS layer).
+      const cardHit = overlayHost.hitTest?.(click.position?.x, click.position?.y, {
+        sourceId: CONFLICTS_OVERLAY_SOURCE_ID,
+      });
+      if (cardHit) {
+        const entityId = conflictEntityIdFromOverlayEntryId(cardHit.entryId);
+        if (entityId && _recordById.has(entityId)) {
+          selectEvent(entityId);
+          return;
+        }
+      }
       clearSelection();
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
     registerPickOwner('conflicts', (pickedId) => (
@@ -301,6 +347,20 @@ export function createConflictsLayer({ overlayHost = DEFAULT_OVERLAY_HOST } = {}
       _total = 0;
       _lastUpdate = null;
       _lastError = null;
+    },
+
+    /** Select one marker by entity id (double-click dive and voice share it). */
+    selectEvent,
+
+    /**
+     * Currently selected entity id ('conflict:<ucdpId>') or null. The
+     * double-click dive reads this as its fallback: the first click of the
+     * gesture selected the record, so the second click can still dive it
+     * even when the overlay hit rects are briefly empty.
+     * @returns {string|null}
+     */
+    getSelectedId() {
+      return _selectedId;
     },
 
     /**

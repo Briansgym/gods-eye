@@ -8,8 +8,17 @@
 // Run with: npm test
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as Cesium from 'cesium';
-import { diveOnPick, pickedWorldPosition } from './commandRail.js';
+import {
+  diveOnPick,
+  pickedWorldPosition,
+  resolveDivePicked,
+  selectedConflictPick,
+} from './commandRail.js';
+import { conflictDiveBanner } from './data/conflictsModel.js';
 import { WORLD_FOCUS_FRAMING } from './worldFocus.js';
 
 const DAM_BASE = Cesium.Cartesian3.fromDegrees(-114.9817, 36.0161, 220); // Hoover Dam
@@ -126,6 +135,164 @@ test('empty pick or unresolvable position is a strict no-op', () => {
   assert.equal(calls.focus.length, 0);
   assert.equal(calls.fly.length, 0);
   assert.equal(calls.banner.length, 0);
+});
+
+// CONFLICT LABEL DOUBLE-CLICK — the visible yellow/orange/red fatality labels
+// are world-overlay entries ~15 px ABOVE their Cesium point, painted on a
+// pointer-events:none canvas. scene.pick on the label is empty sky, so the
+// dive falls back to the overlay's painted hit rects (resolveDivePicked).
+
+const CONFLICT_RECORD = {
+  id: '628272',
+  type: 3,
+  conflict: 'Sahel insurgency',
+  country: 'Mali',
+  lat: 14.5,
+  lon: -1.5,
+  dateStart: '2026-06-04 00:00:00.000',
+  deathsBest: 12,
+};
+
+/** Layer registry with a conflicts module that records selectEvent calls. */
+function conflictLayers(selected = []) {
+  return new Map([[
+    'conflicts',
+    {
+      module: {
+        getAnalystRecords: () => [CONFLICT_RECORD],
+        selectEvent: (entityId) => { selected.push(entityId); return true; },
+      },
+    },
+  ]]);
+}
+
+test('scene.pick miss + overlay label hit resolves the conflict and dives with the inspect banner', () => {
+  const picked = resolveDivePicked({ x: 100, y: 40 }, {
+    scenePick: () => undefined, // label sits over empty sky
+    overlayHitTest: (x, y, options) => {
+      assert.equal(x, 100);
+      assert.equal(y, 40);
+      assert.equal(options.sourceId, 'conflicts');
+      return { sourceId: 'conflicts', entryId: '628272' };
+    },
+  });
+  assert.deepEqual(picked, { id: 'conflict:628272' });
+  const selected = [];
+  const { calls, deps } = stubDeps();
+  // A stale follow (e.g. the Viewer's own double-click tracker) would cancel
+  // flyToBoundingSphere mid-flight — the dive must clear it before flying.
+  const gev = stubGev(conflictLayers(selected));
+  gev.viewer.trackedEntity = 'stale-follow';
+  const outcome = diveOnPick(gev, picked, deps);
+  assert.equal(outcome, 'conflict');
+  assert.equal(gev.viewer.trackedEntity, undefined, 'the dive must clear any leftover trackedEntity');
+  // The dive goes through the world-focus request lane — the same camera path
+  // that zooms dams — NOT flyToLandmark, which never releases the globe
+  // lookAt/follow transform and loses the flight.
+  assert.equal(calls.fly.length, 0, 'flyToLandmark must not be used for the conflict dive');
+  assert.equal(calls.focus.length, 1);
+  const detail = calls.focus[0];
+  assert.equal(detail.kind, 'entity');
+  assert.equal(detail.id, 'conflict:628272');
+  assert.equal(detail.label, CONFLICT_RECORD.conflict);
+  const expectedPos = Cesium.Cartesian3.fromDegrees(CONFLICT_RECORD.lon, CONFLICT_RECORD.lat);
+  assert.ok(detail.position instanceof Cesium.Cartesian3);
+  assert.ok(Cesium.Cartesian3.distance(detail.position, expectedPos) < 1);
+  assert.equal(calls.banner[0].text, conflictDiveBanner(CONFLICT_RECORD));
+  assert.equal(calls.banner[0].tone, 'ok');
+  // The dive also fills the context/readout, same as the news chip / voice.
+  assert.deepEqual(selected, ['conflict:628272']);
+});
+
+// DEFAULT VIEWER DOUBLE-CLICK — Cesium's Viewer registers pickAndTrackObject
+// on LEFT_DOUBLE_CLICK, which sets trackedEntity at globe-scale range and
+// cancels our flyToBoundingSphere dive. The command rail owns double-click,
+// so installDoubleClickDive must remove the Viewer default before adding its
+// own handler. installDoubleClickDive is module-private (wired via
+// initCommandRail), so this is a source-shape assertion.
+test('installDoubleClickDive removes the Viewer default LEFT_DOUBLE_CLICK action before adding its own', () => {
+  const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const source = fs.readFileSync(path.join(ROOT, 'src', 'commandRail.js'), 'utf8');
+  const install = source.match(/function installDoubleClickDive\(viewer\) \{([\s\S]*?)\n\}/);
+  assert.ok(install, 'installDoubleClickDive is missing');
+  const bodyText = install[1];
+  const removal = bodyText.indexOf('viewer.screenSpaceEventHandler?.removeInputAction?.(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK)');
+  assert.ok(removal >= 0, 'the Viewer default LEFT_DOUBLE_CLICK action must be removed (guarded)');
+  const install2 = bodyText.indexOf('new Cesium.ScreenSpaceEventHandler');
+  assert.ok(install2 > removal, 'the default must be removed BEFORE our handler is added');
+});
+
+test('scene.pick miss + overlay miss stays a strict no-op — no banner, no fly', () => {
+  const picked = resolveDivePicked({ x: 5, y: 5 }, {
+    scenePick: () => undefined,
+    overlayHitTest: () => null,
+  });
+  assert.equal(picked, null);
+  const { calls, deps } = stubDeps();
+  assert.equal(diveOnPick(stubGev(conflictLayers()), picked, deps), null);
+  assert.equal(calls.banner.length, 0);
+  assert.equal(calls.fly.length, 0);
+  assert.equal(calls.focus.length, 0);
+});
+
+// SELECTED-CONFLICT FALLBACK — the LEFT_CLICK half of the double-click gesture
+// already selected the record; when scene.pick AND the overlay hit rects both
+// miss on the LEFT_DOUBLE_CLICK (rects can be empty for the frame between an
+// invalidation and the next paint), the dive must fall back to the conflicts
+// layer's current selection instead of dying.
+test('pick + overlay miss still dives the already-selected conflict via world-focus', () => {
+  assert.equal(
+    resolveDivePicked({ x: 9, y: 9 }, { scenePick: () => undefined, overlayHitTest: () => null }),
+    null,
+  );
+  const selected = [];
+  const layers = new Map([[
+    'conflicts',
+    {
+      module: {
+        getAnalystRecords: () => [CONFLICT_RECORD],
+        selectEvent: (entityId) => { selected.push(entityId); return true; },
+        getSelectedId: () => 'conflict:628272',
+      },
+    },
+  ]]);
+  const fallback = selectedConflictPick({ layers });
+  assert.deepEqual(fallback, { id: 'conflict:628272' });
+  const { calls, deps } = stubDeps();
+  const outcome = diveOnPick(stubGev(layers), fallback, deps);
+  assert.equal(outcome, 'conflict');
+  assert.equal(calls.focus.length, 1);
+  assert.equal(calls.focus[0].kind, 'entity');
+  assert.equal(calls.focus[0].id, 'conflict:628272');
+  assert.equal(calls.banner[0].tone, 'ok');
+  // No selection / no conflicts layer / no manager → empty sky stays a no-op.
+  assert.equal(selectedConflictPick({ layers: new Map() }), null);
+  assert.equal(
+    selectedConflictPick({ layers: new Map([['conflicts', { module: { getSelectedId: () => null } }]]) }),
+    null,
+  );
+  assert.equal(selectedConflictPick(null), null);
+  // And the double-click handler actually wires the fallback (source shape,
+  // same style as the Viewer-default removal assertion below).
+  const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const source = fs.readFileSync(path.join(ROOT, 'src', 'commandRail.js'), 'utf8');
+  const install = source.match(/function installDoubleClickDive\(viewer\) \{([\s\S]*?)\n\}/);
+  assert.ok(install, 'installDoubleClickDive is missing');
+  assert.ok(
+    install[1].includes('?? selectedConflictPick(gev.dataManager)'),
+    'the double-click handler must fall back to the selected conflict when the pick resolves null',
+  );
+});
+
+test('a direct conflict point pick wins — the overlay is never consulted', () => {
+  const pointPick = { id: 'conflict:628272' };
+  let overlayConsulted = 0;
+  const picked = resolveDivePicked({ x: 100, y: 55 }, {
+    scenePick: () => pointPick,
+    overlayHitTest: () => { overlayConsulted += 1; return { entryId: '999999' }; },
+  });
+  assert.equal(picked, pointPick);
+  assert.equal(overlayConsulted, 0);
 });
 
 test('pickedWorldPosition resolves every documented pick shape in preference order', () => {

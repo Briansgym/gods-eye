@@ -9899,3 +9899,96 @@ body.recording-mode #gev-spend-hud {
     bottom: calc(2vh + 7.6rem); /* credits sit at calc(2vh + 5rem) here */
   }
 }
+
+/* ================= Phone (≤720px) — command rail usability ================ */
+/* iPhone (~390px) pass: full-width rail above the home indicator, 44px tap
+   targets, 16px input (stops iOS focus-zoom). Desktop >720px is untouched —
+   every rule lives inside this media query, appended last so it wins the
+   cascade at equal specificity. env() works because index.html ships
+   viewport-fit=cover. */
+@media (max-width: 720px) {
+  #command-rail {
+    right: 12px;
+    left: 12px;
+    bottom: max(12px, env(safe-area-inset-bottom, 0px));
+    flex-flow: row wrap;
+    gap: 8px;
+  }
+
+  /* Typed box keeps its own full-width line above the wrapping chips. */
+  #command-box-form {
+    flex: 1 1 100%;
+    margin-bottom: 0;
+  }
+
+  #command-box {
+    min-height: 44px;
+    padding: 10px 14px;
+    font-size: 16px; /* ≥16px keeps iOS Safari from zooming the page on focus */
+  }
+
+  /* Chips share the row and wrap — thumb-sized, never off-screen. */
+  #command-rail .command-chip {
+    flex: 1 1 auto;
+    justify-content: center;
+    min-height: 44px;
+    padding: 10px 12px;
+    font-size: 14px;
+    letter-spacing: 0.06rem;
+  }
+
+  #command-rail-status {
+    flex: 1 1 100%;
+    max-width: none;
+  }
+
+  /* VOICE/MAPS spend readout is clutter at phone width. */
+  #gev-spend-hud {
+    display: none;
+  }
+
+  /* The rail owns the bottom band now (~160px). Tuck the command dock
+     (LOCATION / MIC / PRESETS — the mic pill rides inside it), the
+     standalone mic-pill fallback, the map attribution, and the intel HUD
+     bottom bar above it. Credits move but stay visible — Google/Cesium ToS. */
+  #command-dock {
+    bottom: calc(max(12px, env(safe-area-inset-bottom, 0px)) + 160px);
+  }
+
+  #gev-voice-control {
+    right: 12px;
+    bottom: calc(max(12px, env(safe-area-inset-bottom, 0px)) + 160px);
+  }
+
+  body:not(.ui-clean-view):not(.recording-mode) #cesium-credits {
+    bottom: calc(max(12px, env(safe-area-inset-bottom, 0px)) + 240px);
+  }
+
+  .hud-bottom-bar {
+    bottom: calc(max(12px, env(safe-area-inset-bottom, 0px)) + 258px);
+  }
+
+  /* Phone collapses the desktop cockpit: panels, dock, CCTV, roster, HUDs.
+     The command rail (fly-to box + chips) IS the phone UI; the globe,
+     credits (ToS), title bar, and the three round top actions stay. */
+  #left-panel-stack,
+  #command-dock,
+  #cctv-panel,
+  #news-roster-panel,
+  #style-indicator,
+  #pp-toggles,
+  #param-slider-panel,
+  #gev-voice-control,
+  #intel-hud,
+  #right-context-rail,
+  #global-context-panel {
+    display: none !important;
+  }
+
+  /* With the cockpit gone, keep the title bar but slim it down. */
+  #title-bar {
+    padding: 4px 10px;
+    font-size: 12px;
+    letter-spacing: 0.08rem;
+  }
+}
